@@ -65,6 +65,16 @@ class CarPlayService : Service() {
         // 下车：车机蓝牙 ACL 断开（由 startService 投递——服务在跑时进程已是前台服务态，
         // 不受后台启动限制）。disconnect 内部会 stopService → onDestroy。
         if (intent?.action == ACTION_AUTO_STOP_SESSION) {
+            // 2026-10-27 SmartBox-A703 定谳：蓝牙 ACL 断开**不一定是下车**——有线转无线
+            // 盒子在 RECORD 后（尤其收到 disableBluetooth 后）会主动关蓝牙 iAP2 socket，
+            // 把 iAP2 控制会话迁到 WiFi（handoff 的正常行为），此时视频仍在 WiFi 上推流。
+            // 若照旧把「蓝牙断开」当「下车」拆会话，就会把还活着的视频会话一起拆掉
+            // （实测 RECORD 后 2~12s 必断，一直误判成「盒子看门狗拆链」）。判据：
+            // **视频还在推流 = 蓝牙断开是 handoff，不是下车**——不拆。
+            if (SessionController.videoSender?.isRunning == true) {
+                fileLog("SVC: 车机蓝牙断开但视频仍在推流——判定为 iAP2 handoff（蓝牙退役迁 WiFi），不结束会话")
+                return START_NOT_STICKY
+            }
             fileLog("SVC: 收到「下车自动结束」——收起会话")
             if (SessionController.isSessionRunning()) {
                 SessionController.disconnect(applicationContext)

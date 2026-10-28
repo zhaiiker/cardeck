@@ -68,13 +68,20 @@ object VirtualLauncher {
     // ---- 仪表盘分屏（拖拽把手）----
     // 比例 = tile 主轴长占「可用长度」（应用区主轴 − 两端边距 − 把手宽）的比例。
 
-    /** 默认比例：0.5 恰使把手中心落在应用区正中（见 dashSplitGeom 注释）。 */
-    const val DASH_SPLIT_DEFAULT_FRACTION = 0.5f
+    /**
+     * 默认比例：0.78 = 地图占左/上一多半、音乐卡占右侧窄条（2026-10-28 用户需求：
+     * 「地图占据屏幕一多半，音乐播放器只需要占据右侧一点点」）。0.5 是旧默认
+     * （把手恰在应用区正中）。用户拖动把手后以持久化偏好为准。
+     */
+    const val DASH_SPLIT_DEFAULT_FRACTION = 0.78f
 
-    /** 比例钳制域：任一卡最小占 20%，防拖成一条线（按钮/圆角全挤没）。 */
-    const val DASH_SPLIT_MIN_FRACTION = 0.2f
+    /**
+     * 比例钳制域：任一卡最小占 15%，防拖成一条线（按钮/圆角全挤没）。
+     * 上限 0.85 = 音乐卡最小 ~15%——比旧 0.8 更窄一档，满足「音乐只占一点点」。
+     */
+    const val DASH_SPLIT_MIN_FRACTION = 0.15f
 
-    const val DASH_SPLIT_MAX_FRACTION = 0.8f
+    const val DASH_SPLIT_MAX_FRACTION = 0.85f
 
     private const val PREF_KEY_DASH_SPLIT = "dashSplitFraction"
 
@@ -360,6 +367,23 @@ object VirtualLauncher {
     private var mapDisplay: VirtualDisplay? = null
     private var composer: DualDisplayComposer? = null
 
+    /**
+     * 本会话拉起过的第三方应用包名（detach 收尾 force-stop 用）。
+     *
+     * 为什么要记（2026-10-28 用户反馈）：取消连接/车机拆链后虚拟屏释放，跑在里面的
+     * 第三方应用任务会**迁回手机主屏**（导航/音乐还响着，得手动上划清理）。detach 是
+     * 「用户取消」与「车机拆链」两路共用的收口点，在这里对记录过的包逐个
+     * `am force-stop`，任务直接清掉而不是漂回手机屏。
+     * 只记第三方包——自家 DockActivity/GridActivity 无需清理，且 force-stop 自己
+     * 会误伤保活服务。
+     */
+    private val launchedThirdPartyPkgs = LinkedHashSet<String>()
+
+    /** 记录第三方应用包（自家组件返回 false 不记）。 */
+    private fun recordThirdPartyPkg(pkg: String) {
+        if (pkg != appContextRef?.packageName) launchedThirdPartyPkgs.add(pkg)
+    }
+
     /** 当前活动应用屏 ID（TouchRouter 注入目标）。 */
     fun activeAppDisplayId(): Int = if (composer?.isActiveAppHi() == true && appHiDisplayId >= 0) appHiDisplayId else appDisplayId
 
@@ -467,6 +491,12 @@ object VirtualLauncher {
                 .getSharedPreferences("settings", Context.MODE_PRIVATE)
                 .getFloat(PREF_KEY_DASH_SPLIT, DASH_SPLIT_DEFAULT_FRACTION)
                 .let(::clampDashSplitFraction)
+                .let {
+                    // 一次性迁移（2026-10-28）：默认比例改为 0.78（地图一多半+音乐窄条）。
+                    // 偏好里存的是「旧默认 0.5」时视为未设置过——用户从未拖过把手，
+                    // 直接采用新默认；拖过的其它值（用户显式选择）原样保留。
+                    if (it == 0.5f) DASH_SPLIT_DEFAULT_FRACTION else it
+                }
         if (dockAtBottom) {
             val geom = dashSplitGeom(appHeightPx, dashSplitFraction)
             mapTileWidth = appWidth - CARD_MARGIN_PX * 2
@@ -829,6 +859,20 @@ object VirtualLauncher {
                 orientationIds.forEach { runCatching { setIgnoreOrientationRequest(it, false, verify = false) } }
             }
         }
+        // 清掉本会话拉起的第三方应用（2026-10-28 用户反馈）：虚拟屏释放后它们的任务
+        // 会迁回手机主屏（导航还在跑、音乐还在响，需手动上划清理）。这里后台逐包
+        // `am force-stop`——必须在 detach 同步段先取快照（下面马上清空集合/释放屏），
+        // 且必须投后台（shell 往返，detach 可能由主线程触发）。
+        // 快速重连不受影响：新会话 launchApp 是全新任务，force-stop 旧进程反而保证
+        // 新任务按本会话的横屏覆盖/目标屏干净启动。
+        val thirdParty = synchronized(launchedThirdPartyPkgs) { launchedThirdPartyPkgs.toList() }
+        if (thirdParty.isNotEmpty()) {
+            Bg.run("third-party-cleanup") {
+                val killed = thirdParty.count { pkg -> runCatching { Shell.exec("am force-stop $pkg", 5_000L).ok }.getOrDefault(false) }
+                logSink?.invoke("LAUNCHER: 会话结束已清理 $killed/${thirdParty.size} 个虚拟屏应用（$thirdParty）")
+            }
+        }
+        synchronized(launchedThirdPartyPkgs) { launchedThirdPartyPkgs.clear() }
         if (displaysViaService) {
             val svc = CarInputClient.service
             if (svc != null) {
@@ -1184,6 +1228,7 @@ object VirtualLauncher {
             "LAUNCH(${component.packageName}): → 地图屏全屏 ok=$ok out=${result.output.take(80)}",
         )
         if (ok) {
+            recordThirdPartyPkg(component.packageName)
             synchronized(runningApps) { runningApps.add(component) }
             notifyRunningAppsChanged()
             appContextRef?.let {
@@ -1277,6 +1322,9 @@ object VirtualLauncher {
             }
         // 不带 MULTIPLE_TASK：任务已在地图屏时等价于带回前台
         val result = startMapApp(component, mapDisplayId, forceNewTask = false)
+        if (result.ok && result.output.contains("Starting:", ignoreCase = true)) {
+            recordThirdPartyPkg(component.packageName)
+        }
         logSink?.invoke(
             "LAUNCHER: 默认地图 ${component.packageName} → 地图屏（display=$mapDisplayId）ok=" +
                 (result.ok && result.output.contains("Starting:", ignoreCase = true)) +
@@ -1364,6 +1412,7 @@ object VirtualLauncher {
                 "out=${result.output.take(80)}",
         )
         if (ok) {
+            recordThirdPartyPkg(component.packageName)
             synchronized(runningApps) { runningApps.add(component) }
             notifyRunningAppsChanged()
             // 仪表盘/全屏地图中打开普通应用：退出仪表盘并隐藏地图层，

@@ -32,9 +32,6 @@ import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
-import io.github.shaonialife.cardeck.legal.DisclaimerDialog
-import io.github.shaonialife.cardeck.legal.DisclaimerPrefs
-import io.github.shaonialife.cardeck.legal.needsDisclaimerAtLaunch
 import io.github.shaonialife.cardeck.media.NotificationAccess
 import io.github.shaonialife.cardeck.service.CarPlayService
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
@@ -61,7 +58,6 @@ class MainActivity : AppCompatActivity() {
     /** 连接中的默认副标题（无阶段提示时）。 */
     private companion object {
         const val DEFAULT_CONNECTING_HINT = "蓝牙 iAP2 握手 → 加入车机热点 → 建立 CarPlay 会话"
-        const val KEY_DISCLAIMER_DEADLINE = "disclaimer_deadline"
     }
 
     private lateinit var deviceSubtitle: TextView
@@ -111,11 +107,6 @@ class MainActivity : AppCompatActivity() {
 
     // 英雄卡实时帧率：1s 轮询对 VideoSender 已发帧计数取差值
     private var lastSentFrames = 0L
-
-    /** 免责声明倒计时截止时刻（elapsedRealtime；旋转重建后透传，不重新计时）。 */
-    private var disclaimerDeadlineAt = 0L
-
-    private var activeDisclaimer: androidx.appcompat.app.AlertDialog? = null
 
     /** Shizuku 授权结果监听（onDestroy 必须注销，否则跨 Activity 泄漏）。 */
     private var shizukuPermissionListener:
@@ -227,39 +218,15 @@ class MainActivity : AppCompatActivity() {
             .AtomicBoolean(false)
 
     /**
-     * 「启动连接」前的音频选择弹窗：
-     * 音频与视频同时推流会显著增加负载（实测 48k 立体声 PCM ≈1.5Mbps + 视频 ≈4Mbps），
-     * 测试台出现画面卡顿与断连；真车链路能力未知。因此默认不推音频，需用户显式开启。
+     * 连接前的音频决策（2026-10-27 起不再弹窗）：默认直接开启声音。
      *
-     * 三个选项竖排（横排会挤爆窄屏）：推荐项「仅视频」放第一位并用实心强调
-     * ——与正文「以看视频为主时建议暂不开启」一致；取消在最下。
+     * 历史：早期音视频同推增加负载、测试台卡顿，所以弹窗让用户选「仅视频」。
+     * 现在两条音频路径都不再和视频抢同一链路——软件盒子（YCast）走蓝牙 A2DP
+     * 旁路（不经 AirPlay），真车 AirPlay 音频与视频也已在奥迪上验证稳定。
+     * 按用户要求移除弹窗，声音默认开启；「仅视频」仍可通过断开后手动开关控制。
      */
     private fun showAudioChoiceDialog() {
-        // 默认档 = 高质量媒体通路（type=102 + AAC-LC，真 iPhone 走这条）；
-        // 「兼容档」= 强制只走 PCM 旧通路（type=100），AAC 被车机直接拒掉时的人工退路。
-        // 按钮竖排每个约 36dp：横屏屏高只有 ~300dp，再多一个「取消」就会顶出屏幕，
-        // 因此横屏省略「取消」（弹窗默认可返回键/点外部关闭）。
-        val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        val actions =
-            buildList {
-                add(
-                    DarkMessageDialog.Action(
-                        "仅视频（更流畅）",
-                        DarkMessageDialog.Emphasis.PRIMARY,
-                    ) { beginWithAudio(enabled = false) },
-                )
-                add(DarkMessageDialog.Action("开启声音") { beginWithAudio(enabled = true) })
-                if (!landscape) add(DarkMessageDialog.Action("取消") {})
-            }
-        DarkMessageDialog.show(
-            activity = this,
-            title = "是否在车机侧播放声音？",
-            message =
-                "开启后手机媒体/导航声音投到车机播放、手机本机静音（不开启则车上无声）。\n" +
-                    "音视频同时传会增加负载，以看视频为主时可先不开启。\n" +
-                    "开启声音需要「投屏」权限，会一并申请。",
-            actions = actions,
-        )
+        beginWithAudio(enabled = true)
     }
 
     /** 「取消连接」确认弹窗（防误触）：中止当前连接尝试并断开蓝牙/WiFi 链路。 */
@@ -457,7 +424,7 @@ class MainActivity : AppCompatActivity() {
      * 走 [DarkMessageDialog] 自绘面板——系统 AlertDialog 是浅色主题，与深色 UI 割裂。
      */
     private fun promptShizukuNotReady(state: ShizukuGate.State) {
-        val guidance = ShizukuGate.guidanceOf(state)
+        val guidance = ShizukuGate.guidanceOf(ShizukuGate.toEnv(state))
         val actions = mutableListOf<DarkMessageDialog.Action>()
         actions += DarkMessageDialog.Action("取消") {}
         actions +=
@@ -552,8 +519,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        // 旋转/重建：沿用原倒计时截止时刻（onResume 据此续弹）
-        disclaimerDeadlineAt = savedInstanceState?.getLong(KEY_DISCLAIMER_DEADLINE, 0L) ?: 0L
 
         appVersionFooter = findViewById(R.id.appVersionFooter)
         appVersionFooter.text = "CarDeck v${BuildConfig.VERSION_NAME}"
@@ -716,39 +681,6 @@ class MainActivity : AppCompatActivity() {
         findViewById<android.widget.FrameLayout>(R.id.contentArea).post {
             if (!isFinishing && !isDestroyed) applyContentLayout(startLandscape)
         }
-
-        // 免责声明：未接受当前版本时强制弹（不可取消、需倒计时 + 滑到底）。
-        // savedState 非空（旋转/重建）时复用原截止时刻，不重新计时。
-        if (savedInstanceState == null &&
-            needsDisclaimerAtLaunch(
-                DisclaimerPrefs.acceptedVersion(this),
-                DisclaimerPrefs.CURRENT_VERSION,
-            )
-        ) {
-            showDisclaimer(requireAcceptance = true)
-        }
-    }
-
-    /** 底部「免责声明」入口：只读重看（不限制时长、不要求滑到底）。 */
-    private fun showDisclaimer(requireAcceptance: Boolean) {
-        if (activeDisclaimer?.isShowing == true) return
-        if (requireAcceptance && disclaimerDeadlineAt == 0L) {
-            disclaimerDeadlineAt = SystemClock.elapsedRealtime() + DisclaimerDialog.COUNTDOWN_MS
-        }
-        activeDisclaimer =
-            DisclaimerDialog
-                .show(
-                    activity = this,
-                    requireAcceptance = requireAcceptance,
-                    deadlineAt = disclaimerDeadlineAt,
-                    onDecline = {
-                        // 放弃使用：结束本任务并退出（不用 System.exit，保留正常生命周期收尾）。
-                        // 若已有会话在跑，先正常断开，避免留下无人管理的推流与虚拟屏。
-                        runCatching { SessionController.disconnect(this) }
-                        finishAndRemoveTask()
-                    },
-                    onDismiss = { activeDisclaimer = null },
-                )
     }
 
     /** onCreate 的 UI 初始化尾部：开关/按钮/折叠卡（会话逻辑不变，仅挂新界面）。 */
@@ -759,10 +691,8 @@ class MainActivity : AppCompatActivity() {
             preferences.edit().remove("mode").apply()
         }
 
-        // ---- 免责声明（只读重看）----
-        findViewById<LinearLayout>(R.id.btnDisclaimer).setOnClickListener {
-            showDisclaimer(requireAcceptance = false)
-        }
+        // ---- 免责声明入口（2026-10-27 起隐藏：用户要求移除该弹窗与入口）----
+        findViewById<LinearLayout>(R.id.btnDisclaimer).visibility = View.GONE
 
         // ---- 远程调试入口：仅 remote 调试包存在该组件时显示（正式包 resolve 为 null，恒隐藏；
         // 主代码不引用任何 bridge 类，靠组件探测实现 flavor 差异，调试代码零混入正式产物）----
@@ -1016,7 +946,7 @@ class MainActivity : AppCompatActivity() {
             val gate = ShizukuGate.state(this)
             if (gate != ShizukuGate.State.READY) {
                 heroSubline.text =
-                    "Shizuku 未就绪（${ShizukuGate.guidanceOf(gate).title}）——" +
+                    "Shizuku 未就绪（${ShizukuGate.guidanceOf(ShizukuGate.toEnv(gate)).title}）——" +
                     "无法连接，点下方「Shizuku」查看怎么处理"
             }
         }
@@ -2313,20 +2243,10 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         mainHandler.post(heroTick)
-        // 旋转/重建后尚未接受：用原截止时刻续弹（不重新等 10 秒）
-        if (needsDisclaimerAtLaunch(
-                DisclaimerPrefs.acceptedVersion(this),
-                DisclaimerPrefs.CURRENT_VERSION,
-            ) &&
-            activeDisclaimer?.isShowing != true
-        ) {
-            showDisclaimer(requireAcceptance = true)
-        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putLong(KEY_DISCLAIMER_DEADLINE, disclaimerDeadlineAt)
     }
 
     /**
@@ -2458,9 +2378,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // 强制声明不得随 Activity 销毁残留窗口（旋转时 Activity 重建，onResume 会续弹）
-        runCatching { activeDisclaimer?.dismiss() }
-        activeDisclaimer = null
         shizukuPermissionListener?.let {
             runCatching { rikka.shizuku.Shizuku.removeRequestPermissionResultListener(it) }
         }

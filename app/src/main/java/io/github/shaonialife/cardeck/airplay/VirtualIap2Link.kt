@@ -122,8 +122,8 @@ class VirtualIap2Link(
     private var controlSynRoundStartedAtMs = 0L
     private var controlSynGaveUp = false
 
-    /** 未处理的控制会话消息计数（媒体键排查的观测点，见 [maybeRespondControlCsmLocked]）。 */
-    private var unknownCsmIds = 0
+    /** 未处理的控制会话消息计数（按消息号分组——媒体键排查的观测点，见 [maybeRespondControlCsmLocked]）。 */
+    private val unknownCsmCounts = HashMap<Int, Int>()
 
     /** 上一次记录过的链路状态（只在对日志里出现一次状态迁移）。 */
     private var lastLinkState = Iap2LinkEngine.State.IDLE
@@ -199,6 +199,25 @@ class VirtualIap2Link(
             mib3Armed = true
             sendControlIap(Iap2LinkEngine.MARKER)
             log("IAPLINK: MIB3 detect 已发（控制通道 iAPSendMessage，代际=$generation）——等待车机")
+        }
+    }
+
+    /**
+     * 被动布防（2026-10-27 YCast 定谳）：只 [begin]，**不**主动 POST 裸 marker。
+     *
+     * YCast 盒子（EVENT_LINK 代际）自己以 1Hz 无限重发 marker（临拆链前尤为密集），
+     * 收到 [EVENT_LINK_MARKER_THRESHOLD] 个后由 [onCarBytes] 走
+     * [startControlRoundLocked] 回「marker + 会话表」协商——不需要我们主动 detect。
+     * 而主动 POST 裸 marker（盒子自己的保活字节原样回送）是 12:42 轮「detect 后
+     * 5ms 整链 RST」的头号嫌疑，因此被动形态对这类接收端更安全：一样能完成链路
+     * 协商（解决 RECORD 后 ~10s 看门狗拆链），又不冒「回送保活字节」的险。
+     */
+    fun armPassive() {
+        synchronized(lock) {
+            begin()
+            if (mib3Armed) return
+            mib3Armed = true
+            log("IAPLINK: 被动布防（不主动 detect——等车机 marker 触发协商，YCast 形态）")
         }
     }
 
@@ -719,13 +738,26 @@ class VirtualIap2Link(
                 // 在日志里看到对应消息号（切歌按键排查的关键观测点）。
                 // 带全量 hex：宝马 iD9 的 0xad00/0xad02/0xad03 家族既不在 Apple 公开表里，
                 // 也没有参考实现的命名——只能靠报文体结构反推它是不是输入（触摸/HID）通路。
-                unknownCsmIds++
-                if (unknownCsmIds <= 20) {
-                    log(
-                        "IAPLINK: 未处理的 CSM 0x${frame.messageId.toString(16)} " +
-                            "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B hex=" +
-                            frame.body.joinToString(" ") { "%02x".format(it) },
-                    )
+                //
+                // 2026-10-27 SmartBox 降级：0xfffb（PASCD 定位样本）等**每 500ms 一条**的
+                // 车辆数据会刷屏（43B 全量 hex 每 0.5s 一条，日志文件很快膨胀）。改为
+                // **按消息号分组**：每种未知消息号只打一次全量摘要，之后静默计数，
+                // 每累计 100 条打一条「已静默 N 条」——既保留「首次见到新消息号」的观测点，
+                // 又不被高频车辆数据淹没。
+                val count = (unknownCsmCounts[frame.messageId] ?: 0) + 1
+                unknownCsmCounts[frame.messageId] = count
+                when {
+                    count == 1 ->
+                        log(
+                            "IAPLINK: 未处理的 CSM 0x${frame.messageId.toString(16)} " +
+                                "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B hex=" +
+                                frame.body.joinToString(" ") { "%02x".format(it) },
+                        )
+                    count % 100 == 0 ->
+                        log(
+                            "IAPLINK: 未处理的 CSM 0x${frame.messageId.toString(16)} " +
+                                "已静默 $count 条（首次见上方摘要）",
+                        )
                 }
             }
         }

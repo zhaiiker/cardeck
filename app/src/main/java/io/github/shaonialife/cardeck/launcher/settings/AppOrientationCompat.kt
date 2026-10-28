@@ -2,6 +2,7 @@ package io.github.shaonialife.cardeck.launcher.settings
 
 import android.content.Context
 import android.os.Build
+import io.github.shaonialife.cardeck.shizuku.RootGate
 import io.github.shaonialife.cardeck.shizuku.Shell
 import java.util.concurrent.Executors
 
@@ -44,6 +45,27 @@ object AppOrientationCompat {
     private fun key(pkg: String) = "force_$pkg"
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /**
+     * `am compat` 命令的统一执行口（**root 优先**，2026-10-27 定谳）。
+     *
+     * 为什么必须 root：`am compat enable` 对**非 debuggable 应用**在 user build 上
+     * 会被系统直接拒绝（`Cannot override a change on a non-debuggable app and user
+     * build.`）——Shizuku 是 uid 2000，和 adb shell 同级，绕不过这条限制（此前
+     * 「强制横屏没生效」的根因：高德/头条等全是非 debuggable 应用，Shell.exec
+     * 写的覆盖被系统拒了，日志里只有一句 `non-debuggable` 拒绝）。root（uid 0）
+     * 的 am compat 不受 user build 限制，普通应用也能真正写入横屏覆盖。
+     *
+     * root 不可用时回退 Shell.exec（uid 2000，无 root 用户的原有行为）。
+     */
+    private fun compatExec(
+        cmd: String,
+        timeoutMs: Long = 4_000L,
+    ): Shell.Result {
+        val rootResult = RootGate.exec(cmd, timeoutMs)
+        if (rootResult != null) return rootResult
+        return Shell.exec(cmd, timeoutMs)
+    }
 
     fun isEnabled(
         context: Context,
@@ -124,10 +146,10 @@ object AppOrientationCompat {
         enable: Boolean,
     ): WriteResult {
         val action = if (enable) "enable" else "disable"
-        val first = Shell.exec("am compat $action $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", timeoutMs = 4000)
+        val first = compatExec("am compat $action $CHANGE_UNDEFINED_TO_NOSENSOR $pkg")
         val second =
             if (first.ok) {
-                Shell.exec("am compat $action $CHANGE_ANY_ORIENTATION $pkg", timeoutMs = 4000)
+                compatExec("am compat $action $CHANGE_ANY_ORIENTATION $pkg")
             } else {
                 // 第一条就被拒时不再写第二条（同一限制，省一次无谓的 shell 往返）
                 first
@@ -283,10 +305,10 @@ object AppOrientationCompat {
         }
         var count = 0
         for (pkg in pkgs) {
-            val first = Shell.exec("am compat enable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", timeoutMs = 4000)
+            val first = compatExec("am compat enable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg")
             if (!first.ok) {
-                // ChangeId 已注册仍被拒 → user build 不允许改非 debuggable 应用；
-                // 同样整体停止，不逐应用空跑。
+                // ChangeId 已注册仍被拒 → user build 不允许改非 debuggable 应用
+                // （root 可用时不该走到这；这里只剩「无 root 用户」的固有限制）
                 if (isPermanentRejection(first.output)) {
                     diagSink?.invoke(
                         "ORIENTATION: 系统限制——user 版本只允许修改可调试(debuggable)应用的" +
@@ -296,7 +318,7 @@ object AppOrientationCompat {
                 }
                 continue
             }
-            val second = Shell.exec("am compat enable $CHANGE_ANY_ORIENTATION $pkg", timeoutMs = 4000)
+            val second = compatExec("am compat enable $CHANGE_ANY_ORIENTATION $pkg")
             if (second.ok) count++
         }
         return count
@@ -306,8 +328,8 @@ object AppOrientationCompat {
     fun resetAll(context: Context): Int {
         var count = 0
         enabledPkgs(context).forEach { pkg ->
-            Shell.exec("am compat disable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", timeoutMs = 4000)
-            Shell.exec("am compat disable $CHANGE_ANY_ORIENTATION $pkg", timeoutMs = 4000)
+            compatExec("am compat disable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg")
+            compatExec("am compat disable $CHANGE_ANY_ORIENTATION $pkg")
             count++
         }
         return count
@@ -366,8 +388,8 @@ object AppOrientationCompat {
      * 注意：am compat disable 会立即杀掉目标应用进程（新设置需重启应用生效）。
      */
     fun clearSystemOnly(key: String): Boolean {
-        val ok1 = Shell.exec("am compat disable $CHANGE_UNDEFINED_TO_NOSENSOR $key", timeoutMs = 4000).ok
-        val ok2 = Shell.exec("am compat disable $CHANGE_ANY_ORIENTATION $key", timeoutMs = 4000).ok
+        val ok1 = compatExec("am compat disable $CHANGE_UNDEFINED_TO_NOSENSOR $key").ok
+        val ok2 = compatExec("am compat disable $CHANGE_ANY_ORIENTATION $key").ok
         return ok1 && ok2
     }
 

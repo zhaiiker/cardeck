@@ -102,6 +102,10 @@ class AirPlayClient(
     @Volatile
     private var negotiatedInfo: Map<*, *>? = null
 
+    /** /info 快照（只读）：第二链路门禁等主控侧决策用（model/manufacturer 识别）。 */
+    val negotiatedInfoSnapshot: Map<*, *>?
+        get() = negotiatedInfo
+
     // ---- 对外流程 ----
 
     /** pair-setup 是否被 403 拒绝（真车特征）；主控据此决定是否使用 BT 退役 hack。 */
@@ -637,6 +641,56 @@ class AirPlayClient(
             statusLine.contains("200")
         } catch (error: IOException) {
             log("AIRPLAY: modesChanged 失败 - ${error.message}")
+            false
+        }
+    }
+
+    /**
+     * 发送 disableBluetooth（蓝牙 iAP2 交接命令）：通知接收端「手机要关闭蓝牙 iAP2、
+     * 后续控制会话改走 WiFi 隧道（type-130 DataStream）」。
+     *
+     * 为什么（2026-10-27 SmartBox-A703 定谳）：软件盒子（有线转无线中转）必须走真 iPhone
+     * 的标准交接流程——RECORD 后发 disableBluetooth → 建 type-130 隧道，盒子才能把 iAP2
+     * 控制会话从蓝牙迁移到 WiFi、再转发给车机有线侧。我们此前从未发过这条命令
+     * （代码库 grep disableBluetooth 仅命中一句无关日志），盒子在 RECORD 后一直等
+     * handoff，等到看门狗超时即拆整轮会话（实测 RECORD 后 6~12s 必拆、与 marker/隧道/
+     * 音频/modesChanged 全部无关）。DiPlay 源码（CarPlayController）确认接收端语义：
+     * 收到 disableBluetooth → 置 handoffRequested=true + 武装「等隧道 iAP2 就绪」看门狗；
+     * 缺这条时它看到 RFCOMM 断开即判「wireless bring-up failed」拆掉整个无线栈。
+     *
+     * 命令格式对照 WinPlay cpStack `_handleCommand`（`type === 'disableBluetooth'`）：
+     * `{ type: "disableBluetooth", params: { deviceID: "<手机蓝牙 MAC>" } }`，经**控制通道**
+     * POST /command 发送（不是事件通道）。
+     */
+    fun sendDisableBluetooth(): Boolean {
+        val deviceId = setupDeviceId()
+        val body =
+            BinaryPlist.encode(
+                linkedMapOf(
+                    "type" to "disableBluetooth",
+                    "params" to linkedMapOf<String, Any?>("deviceID" to deviceId),
+                ),
+            )
+        return try {
+            val (statusLine, responseBody) =
+                request(
+                    "POST",
+                    "/command",
+                    body,
+                    contentType = "application/x-apple-binary-plist",
+                )
+            // 响应体通常为空；非空时打印出来（盒子可能回带错误码/说明的 plist，
+            // 用于区分「接受 handoff」与「拒绝/忽略」）。
+            val bodyDesc =
+                if (responseBody.isEmpty()) {
+                    ""
+                } else {
+                    " respBody=${responseBody.size}B hex=${responseBody.take(64).joinToString(" ") { "%02x".format(it) }}"
+                }
+            log("AIRPLAY: disableBluetooth 已发（deviceID=$deviceId）[$statusLine]$bodyDesc")
+            statusLine.contains("200")
+        } catch (error: IOException) {
+            log("AIRPLAY: disableBluetooth 失败 - ${error.message}")
             false
         }
     }
@@ -1193,7 +1247,17 @@ class AirPlayClient(
             log("TUNNEL: 未配对会话没有共享密钥——跳过 iAP 隧道（触摸不可用）")
             return null
         }
-        val host = receiverHost() ?: return null
+        // 第二链路门禁：用户强制关 / fatal 记忆降级（2026-10-27 起 fatal 不再关隧道，
+        // 只降级 marker 布防——type-130 隧道是有线转无线盒子的 handoff 必需）。
+        if (secondLinkGate?.invoke() == false) {
+            log("TUNNEL: 跳过 iAP 隧道（$secondLinkReason）")
+            return null
+        }
+        val host = receiverHost()
+        if (host == null) {
+            log("TUNNEL: 无可用接收端地址——跳过 iAP 隧道")
+            return null
+        }
         val seed = (System.currentTimeMillis() % 0x7FFF_FFFFL) + 1L
         val connectionId = java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L
         val body =
@@ -1210,6 +1274,7 @@ class AirPlayClient(
                         ),
                 ),
             )
+        log("TUNNEL: 发起 type-130 隧道 SETUP（uuid=$IAP_DATASTREAM_UUID seed=$seed connId=$connectionId）")
         val (statusLine, responseBody) =
             try {
                 request("SETUP", "/", body, contentType = "application/x-apple-binary-plist")
@@ -1221,22 +1286,28 @@ class AirPlayClient(
             log("TUNNEL: SETUP 应答 [$statusLine]（响应头：${lastResponseHeadOfRequest()}）")
             return null
         }
+        // 应答体 dump：诊断「盒子回 streams=null」时能看到完整内容（是空 streams、
+        // 还是带 streamID 但无 dataPort、还是别的字段）。
         val root =
             try {
                 BinaryPlist.parse(responseBody) as? Map<*, *>
             } catch (_: IllegalArgumentException) {
                 null
             } ?: run {
-                log("TUNNEL: SETUP 应答解析失败")
+                log("TUNNEL: SETUP 应答解析失败 body=${responseBody.size}B hex=${responseBody.take(128).joinToString(" ") { "%02x".format(it) }}")
                 return null
             }
         val streams = root["streams"] as? List<*>
         val stream = streams?.firstOrNull() as? Map<*, *>
         val dataPort = ((stream?.get("dataPort") as? Long) ?: 0L).toInt() and 0xFFFF
         if (dataPort == 0) {
-            log("TUNNEL: SETUP 应答无 dataPort（streams=$streams）")
+            log(
+                "TUNNEL: SETUP 应答无 dataPort（streams=${streams?.joinToString { it.toString().take(300) }}，" +
+                    "顶层键=${root.keys.joinToString(",") { it.toString().take(120) }}）",
+            )
             return null
         }
+        log("TUNNEL: SETUP 应答 dataPort=$dataPort streamID=${stream?.get("streamID")} connId=${stream?.get("streamConnectionID")}")
         val key =
             AirPlayCrypto.hkdfSha512(
                 sessionKey,
@@ -1364,13 +1435,63 @@ class AirPlayClient(
      * MIB3 布防：屏幕流 SETUP 成功后调用——主动经**控制通道** POST /command 发一次
      * DETECT，随后等车机 SYN（真机 Frida 时序，详见 [VirtualIap2Link.armMib3]）。
      * 明文会话（pre-HomeKit 老车机）没有 WiFi 隧道语义，跳过。
+     *
+     * 2026-10-27 修订：布防**不再**受 [secondLinkGate] 控制（那只管 type-130 隧道）——
+     * YCast 盒子同样需要 marker 协商（不回应 RECORD 后 ~10s 拆链）。布防分派见
+     * [armMib3VirtualLink]：CLASSIC_MIB3 主动 detect、EVENT_LINK 被动等 marker。
+     * [mib3ArmGate] 是独立的降级开关（fatal 记忆：布防本身毒死会话时下次跳过）。
      */
+    var secondLinkGate: (() -> Boolean)? = null
+        private set
+
+    /** 主控注入门禁来源（日志可解释）。 */
+    var secondLinkReason: String? = null
+        private set
+
+    /** 布防独立降级开关：fatal 记忆命中时置 false（布防毒死过会话则下次不布防）。 */
+    var mib3ArmGate: (() -> Boolean)? = null
+        private set
+
+    fun setMib3ArmGate(
+        allowed: Boolean,
+        reason: String,
+    ) {
+        mib3ArmGate = { allowed }
+        mib3ArmReason = reason
+    }
+
+    private var mib3ArmReason: String? = null
+
+    fun setSecondLinkGate(
+        allowed: Boolean,
+        reason: String,
+    ) {
+        secondLinkGate = { allowed }
+        secondLinkReason = reason
+    }
+
     private fun armMib3VirtualLink() {
         if (cipher == null) return
         if (iapTunnel != null) return // DiPlay 隧道形态：不需要（也不该）布防
+        // fatal 降级：布防本身曾毒死会话（协商轮 POST 即 RST）→ 本轮不布防，
+        // 退到「无布防」形态（RECORD 后 ~10s 拆链，但至少能看 10 秒画面）
+        if (mib3ArmGate?.invoke() == false) {
+            log("IAPLINK: 跳过 MIB3 布防（$mib3ArmReason）——降级为无布防形态")
+            return
+        }
+        // 2026-10-27 YCast 二次定谳：marker 布防**不**在第二链路门禁里——YCast 盒子
+        // 也是「marker 1Hz 无限重发、不回应 RECORD 后 ~10s 拆链」形态（11:48 轮
+        // 无音频也被 12s 拆，临拆前每秒一个 ff 55 02 00 ee 10）。门禁只管 iAP 隧道
+        // SETUP（那才是把盒子 5ms 打崩的毒药）。布防分派：CLASSIC_MIB3 主动 detect
+        // （它等我们 detect 才回 SYN）；EVENT_LINK 被动（盒子自己发 marker，
+        // 凑够阈值后协商回应——不主动回送它的保活字节）。
         val generation = linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK
         obtainIapLink().setGeneration(generation)
-        obtainIapLink().armMib3()
+        if (generation == ReceiverProfile.LinkGeneration.CLASSIC_MIB3) {
+            obtainIapLink().armMib3()
+        } else {
+            obtainIapLink().armPassive()
+        }
         mib3LinkArmed = true
     }
 
@@ -1871,15 +1992,21 @@ class AirPlayClient(
                     val audioType = (channel["audioType"] as? String)?.lowercase() ?: return@forEach
                     // 媒体音频只走 media 档；compatibility/default 是提示音/兼容场景
                     if (audioType != AUDIO_TYPE_MEDIA) return@forEach
-                    aac +=
-                        AudioProfile(
-                            audioType = audioType,
-                            formatBit = bit,
-                            sampleRate = rate,
-                            latencyMs = latencyFor(info, audioType, streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.AAC_LC,
-                        )
+                    // 每档 AAC 展开两种封装（2026-10-26 YCast 定谳）：严格接收端两者
+                    // 都收；软件盒子只认 ADTS。RAW 在前（真车验证过的默认），
+                    // ADTS 紧随——同一会话内 SETUP 挂了才轮换，不额外增加试错成本。
+                    AudioTuning.entries.forEach { tuning ->
+                        aac +=
+                            AudioProfile(
+                                audioType = audioType,
+                                formatBit = bit,
+                                sampleRate = rate,
+                                latencyMs = latencyFor(info, audioType, streamType),
+                                streamType = streamType,
+                                codec = AudioCodec.AAC_LC,
+                                tuning = tuning,
+                            )
+                    }
                 }
         }
 

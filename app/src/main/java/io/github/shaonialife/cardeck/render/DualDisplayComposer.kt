@@ -73,6 +73,20 @@ class DualDisplayComposer(
     }
 
     /**
+     * dock 视觉隐藏（2026-10-28 用户需求「打开 APP 自动隐藏侧边栏」）：
+     * 应用打开时不再绘制 dock 条——应用区视觉占满全屏。**不动虚拟屏尺寸、不触发
+     * 应用 relayout**（方案 B）：dock 屏与触摸分流阈值保持原样，TouchRouter 在隐藏时
+     * 把「左缘起的触摸」识别为唤回手势。恢复 = 回桌面/仪表盘（VirtualLauncher 收口）。
+     */
+    @Volatile
+    var dockHidden: Boolean = false
+        private set
+
+    fun setDockHidden(hidden: Boolean) {
+        dockHidden = hidden
+    }
+
+    /**
      * 目标帧率（30/60，合成出帧节奏上限；「显示」设置运行中实时切换）。
      * 有新输入帧时按 1000/targetFps 节流；静止画面保底 30fps 心跳（编码器不能断粮）。
      */
@@ -575,7 +589,7 @@ class DualDisplayComposer(
             if (dockAtBottom) {
                 // 竖屏：dock 横条贴底（GL 坐标 y=0 为底边），app 在其余区域；
                 // 仪表盘时地图卡叠在应用区上半（地图上/音乐下），全屏盖满应用区。
-                if (dock.hasContent) drawInput(dock, 0f, outWidth.toFloat(), 0f, dockH.toFloat())
+                if (!dockHidden && dock.hasContent) drawInput(dock, 0f, outWidth.toFloat(), 0f, dockH.toFloat())
                 if (activeInput?.hasContent == true) {
                     drawInput(activeInput, 0f, outWidth.toFloat(), dockH.toFloat(), outHeight.toFloat())
                 }
@@ -657,8 +671,9 @@ class DualDisplayComposer(
                         )
                     }
                 }
-                // dock 最后绘制（最上层）：tile 滑动经过 dock 区域时从其下方穿过
-                if (dock.hasContent) drawInput(dock, 0f, dockW.toFloat(), 0f, outHeight.toFloat())
+                // dock 最后绘制（最上层）：tile 滑动经过 dock 区域时从其下方穿过。
+                // dockHidden（应用全屏模式）时不绘制——左缘触摸由 TouchRouter 唤回。
+                if (!dockHidden && dock.hasContent) drawInput(dock, 0f, dockW.toFloat(), 0f, outHeight.toFloat())
             }
             // 叠加卡片最后绘制（最上层，不受分支影响）：卡片坐标为输出画面坐标（顶部原点）
             syncOverlayTexture()?.let { card ->

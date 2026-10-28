@@ -10,6 +10,8 @@ import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioProfileMemory
 import io.github.shaonialife.cardeck.audio.AudioSender
 import io.github.shaonialife.cardeck.audio.AudioTuning
+import io.github.shaonialife.cardeck.bt.BluetoothAudioPrefs
+import io.github.shaonialife.cardeck.bt.BtAudioRoute
 import io.github.shaonialife.cardeck.bt.BtProfiles
 import io.github.shaonialife.cardeck.bt.BtSessionGate
 import io.github.shaonialife.cardeck.bt.Iap2BluetoothClient
@@ -19,6 +21,7 @@ import io.github.shaonialife.cardeck.capture.HiddenDisplaySource
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.iap2.ReceiverProfile
+import io.github.shaonialife.cardeck.iap2.SecondLinkMemory
 import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.HidNavigation
 import io.github.shaonialife.cardeck.input.TouchReports
@@ -35,6 +38,7 @@ import io.github.shaonialife.cardeck.net.WifiConnectCommand
 import io.github.shaonialife.cardeck.net.WifiSavedNetworks
 import io.github.shaonialife.cardeck.service.CarPlayService
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
+import io.github.shaonialife.cardeck.shizuku.RootGate
 import io.github.shaonialife.cardeck.shizuku.Shell
 import io.github.shaonialife.cardeck.shizuku.ShizukuGate
 import io.github.shaonialife.cardeck.ui.ScreenDimmer
@@ -395,6 +399,98 @@ object SessionController {
         senderLinkGenerationCache ?: ReceiverProfile.LinkGeneration.EVENT_LINK
 
     /**
+     * 第二链路门禁（MIB3 marker 布防 + iAP 隧道，2026-10-26 SmartBox-A703 定谳）：
+     * YCast 类软件盒子没有第二条 iAP2 链路的状态机——marker（恰是它自己的保活
+     * 字节）或隧道 SETUP 会让它在屏幕 SETUP 与 RECORD 之间 RST 整链（八轮同点
+     * 失败）。决策优先级：
+     *   1. 用户强制关（调试开关）；
+     *   2. 该车机的持久 fatal 记忆（上次布防后立刻被拆）；
+     *   3. 自动策略（CLASSIC_MIB3 需要；YCast 类软件盒子跳过；其余需要）。
+     * 必须在 runScreenStream **之前**调用——armMib3VirtualLink 在屏幕 SETUP 200
+     * 应答的同步路径上就触发，晚注入等于没拦住。
+     */
+    /**
+     * iAP 隧道门禁（2026-10-27 收窄：只门禁 type-130 隧道 SETUP，marker 协商不受影响）。
+     *
+     * 早先把「marker 布防 + 隧道 SETUP」作为一个「第二链路」整体对 YCast 盒子关闭，
+     * 结果盒子在 RECORD 后 ~10-12s 必被拆（marker 1Hz 无限重发无人回应——与奥迪
+     * MIB3 同款看门狗）。实测证据链：隧道 SETUP 应答后 3ms RST（12:54 轮），而
+     * marker POST 之后盒子仍能处理并应答隧道请求——毒药是隧道，不是 marker。
+     */
+    private fun applySecondLinkGate(client: AirPlayClient) {
+        val ctx = appContext
+        val identity = client.receiverIdentity()
+        // 1. 用户强制关（跨车机全局调试开关，见 DisplayPrefs.secondLinkOff）
+        if (ctx != null && DisplayPrefs.secondLinkOff(ctx)) {
+            client.setSecondLinkGate(false, "用户设置「iAP 隧道」已强制关闭")
+            client.setMib3ArmGate(false, "用户设置「iAP 隧道」已强制关闭")
+            appendLog("IAPLINK: 隧道门禁=关（用户强制）——type-130 隧道 SETUP 与 marker 布防均跳过")
+            return
+        }
+        // 2. 该车机的 fatal 记忆（只降级 marker 布防，**不关隧道**）
+        val memory = SecondLinkMemory.load(ctx, identity)
+        if (memory.fatal) {
+            // 2026-10-27 SmartBox-A703 二次定谳：fatal 记忆只能降级「marker 布防」
+            // （主动 detect 毒死会话的防御），**不能关隧道**——type-130 隧道是
+            // 有线转无线盒子的 handoff 必需（RECORD → disableBluetooth → 隧道）。
+            // 早先 fatal 一并关隧道是「隧道毒药」误判的延续；现在根因是「没发
+            // disableBluetooth + 隧道时序错」，隧道必须开。
+            client.setMib3ArmGate(false, "该车机 fatal 记忆（布防/隧道协商期间被拆）")
+            appendLog("IAPLINK: 布防=关（$identity 的历史 fatal 记忆）——隧道仍开（handoff 必需）")
+            // 不 return，继续走自动策略定隧道门禁
+        }
+        // 3. 自动策略：隧道按画像；布防始终开（marker 协商对 YCast 同样必需）
+        val info = client.negotiatedInfoSnapshot
+        val infoManufacturer = (info?.get("manufacturer") as? String)
+        val infoModel = (info?.get("model") as? String)
+        val allowed =
+            SecondLinkMemory.defaultPolicy(
+                senderLinkGeneration(),
+                infoManufacturer,
+                infoModel,
+            )
+        val reason =
+            if (allowed) {
+                "自动策略：链路代际=${senderLinkGeneration()} model=$infoModel"
+            } else {
+                "自动策略：识别为软件盒子（model=$infoModel）——无 type-130 隧道语义"
+            }
+        client.setSecondLinkGate(allowed, reason)
+        client.setMib3ArmGate(true, "自动策略：marker 协商全代际布防（YCast 也需要）")
+        appendLog(
+            "IAPLINK: 隧道门禁=${if (allowed) "开" else "关"}（$reason，身份=$identity）；marker 布防=开",
+        )
+    }
+
+    /**
+     * 拆链时更新第二链路记忆：布防了但控制会话没完成就被拆 = 布防本身毒死了它
+     * （或链路看门狗——两者对「下次别布防」的决策等价，保守记 fatal 更安全：
+     * 跳过布防最坏是丢媒体键，错误布防是整轮连不上）。
+     */
+    private fun attributeSecondLinkTeardown(client: AirPlayClient) {
+        if (!client.mib3LinkArmed) return
+        if (client.mib3ControlSessionDone) {
+            // 控制会话完成过 → 第二链路协商成功，证伪 fatal 记忆
+            SecondLinkMemory.recordHealthy(appContext, client.receiverIdentity())
+            return
+        }
+        // 2026-10-27 SmartBox-A703 二次定谳：只有「主动 detect」形态（CLASSIC_MIB3）
+        // 的「控制会话没完成就被拆」才可能是 detect 毒死会话——EVENT_LINK（含软件
+        // 盒子）走的是**被动布防**（不主动 POST marker，等车机 marker），盒子根本不会
+        // 发 marker、控制会话**永远**到不了 NORMAL，这是预期行为而非「布防毒死」。
+        // 把它们也记 fatal 会导致下一轮跳过布防（无害但语义错乱），并污染日志。
+        // 软件盒子的拆链根因是缺 modesChanged 重申（见 record() 后的 scheduleModesReclaim），
+        // 与布防无关，故这里只对 CLASSIC_MIB3 记 fatal。
+        if (senderLinkGeneration() != ReceiverProfile.LinkGeneration.CLASSIC_MIB3) return
+        val identity = client.receiverIdentity()
+        SecondLinkMemory.recordFatal(appContext, identity)
+        appendLog(
+            "IAPLINK: ⚠ 布防后控制会话未完成即被拆——记为该车机 fatal（下次跳过第二链路）" +
+                "（$identity）",
+        )
+    }
+
+    /**
      * 最近一次 0x5703 的热点密码（仅内存，不落盘）。
      * 「车机热点 → 去连接」按钮复制到剪贴板用（手动加入兜底场景）。
      */
@@ -563,6 +659,12 @@ object SessionController {
         }
         CarPlayService
             .start(context)
+        // root 加速（可选路径，2026-10-26）：specifier 预批准 + Doze 白名单。
+        // 后台一次性任务：su 探测/执行都是进程级开销（首次触发 Magisk 授权弹窗），
+        // 绝不能进主线程；失败静默——现有 Shizuku 路径不受影响。
+        Bg.run("root-boost") {
+            RootGate.applyConnectionBoosts(context.packageName, ::appendLog)
+        }
         // 能力发布先于连接（catplay 的做法：CarPlayCtrlServer 在会话一开始就常驻广播
         // `_carplay-ctrl._tcp`，之后每 1s force_announce，收到车机邀请才建 AirPlay）。
         // 我们此前要等 0x5703 才注册，导致「车机发现手机」这一步总落在热点绑定之后，
@@ -614,6 +716,8 @@ object SessionController {
         // 代际缓存随会话清零：读取侧有 `?: EVENT_LINK` 兜底，语义不变；留着的话
         // 跨车换连（奥迪→本田）存在读到上一辆缓存的理论窗口（2026-10-23 审阅）。
         senderLinkGenerationCache = null
+        // 蓝牙音频旁路收口：会话结束断开 A2DP，让手机音频回到本机
+        disconnectBluetoothAudioRoute(context)
         if (hadProjection) {
             // Android 14+：MediaProjection 与保活服务（mediaProjection FGS 类型）绑定，
             // 停服务会连带失效授权——下次连接需重新点「申请投屏权限」
@@ -839,9 +943,27 @@ object SessionController {
             if (shellReady) {
                 if (joinCarWifiSilently(wifi) is WifiCarPlayConnector.JoinResult.Joined) return@run
                 if (connectCancelled) return@run
-                // 热点已连上、只是 Network 通道没绑成：绝不能退回 specifier——那会重新
-                // 关联热点并弹系统确认框（用户看到「连上了又弹窗」）。直接中止并提示重连。
+                // 热点已连上、只是 Network 通道没绑成：不退回 specifier（那会重新关联
+                // 热点并弹系统确认框）。静默路径内部已重发过一次请求；这里再做最后一轮
+                // 「等回调」——车机 15s 窗口下每 1s 都珍贵，挂起形态的回调可能晚到
+                // （DHCP/验证慢），多等 5s 换「不用重连一轮 BT」是划算的。
                 if (shellWifiStatus().second == wifi.ssid) {
+                    appendLog("WIFI: 已连在 \"${wifi.ssid}\"，网络句柄尚未回调——再等 5s（挂起形态回调可能晚到）")
+                    val deadline = android.os.SystemClock.uptimeMillis() + 5_000
+                    while (android.os.SystemClock.uptimeMillis() < deadline && !connectCancelled) {
+                        if (wifiConnector?.currentNetwork != null && boundCarSsid == wifi.ssid) {
+                            appendLog("WIFI: 回调晚到但已绑定成功——继续会话")
+                            return@run
+                        }
+                        Thread.sleep(500)
+                    }
+                    if (wifiConnector?.currentNetwork != null) return@run
+                    if (connectCancelled) return@run
+                    // 仍无回调：release 后再发一次（重发被验证是挂起的恢复手段）
+                    appendLog("WIFI: 仍无回调——重发网络请求（最后一次尝试）")
+                    if (bindCarWifiAndRegister(wifi.ssid) && wifiConnector?.currentNetwork != null) {
+                        return@run
+                    }
                     phaseHint = "已连上车机热点但未能绑定网络——请重新连接"
                     appendLog(
                         "WIFI: 已连在 \"${wifi.ssid}\" 但 requestNetwork 未回调——本轮中止" +
@@ -877,8 +999,21 @@ object SessionController {
         if (!shellReady) return joinCarWifiSpecifier(wifi)
         val silent = joinCarWifiSilently(wifi)
         if (silent is WifiCarPlayConnector.JoinResult.Joined) return silent
-        // 热点已连上但通道没绑成：不再走会弹窗的 specifier（见 autoJoinCarWifi 同款判断）
-        if (!connectCancelled && shellWifiStatus().second == wifi.ssid) return silent
+        // 热点已连上但通道没绑成：静默路径内部已重发过一次；再给一轮短等待
+        // （回调可能晚到），仍无果才按失败返回——specifier 对「系统已保存 SSID」
+        // 的机型只会再挂（正是挂起条件），退回它没有意义。
+        if (!connectCancelled && shellWifiStatus().second == wifi.ssid) {
+            val deadline = android.os.SystemClock.uptimeMillis() + 5_000
+            while (android.os.SystemClock.uptimeMillis() < deadline && !connectCancelled) {
+                if (wifiConnector?.currentNetwork != null && boundCarSsid == wifi.ssid) {
+                    return WifiCarPlayConnector.JoinResult.Joined(wifiConnector!!.currentNetwork!!)
+                }
+                Thread.sleep(500)
+            }
+            if (wifiConnector?.currentNetwork != null) {
+                return WifiCarPlayConnector.JoinResult.Joined(wifiConnector!!.currentNetwork!!)
+            }
+        }
         return joinCarWifiSpecifier(wifi)
     }
 
@@ -945,13 +1080,29 @@ object SessionController {
             }
         }
         if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
-        val bound = bindCarWifiAndRegister(wifi.ssid)
-        val network = connector.currentNetwork
-        return if (bound && network != null) {
-            WifiCarPlayConnector.JoinResult.Joined(network)
-        } else {
-            WifiCarPlayConnector.JoinResult.Unavailable
+        val firstBound = bindCarWifiAndRegister(wifi.ssid)
+        val firstNetwork = connector.currentNetwork
+        if (firstBound && firstNetwork != null) {
+            return WifiCarPlayConnector.JoinResult.Joined(firstNetwork)
         }
+        // bindCurrentWifi 无回调（Android 16/部分 ROM：requestNetwork(TRANSPORT_WIFI)
+        // 挂起零回调，SSID 明明已切上）——2026-10-26 SmartBox-A703 两轮实测：这里
+        // 直接判失败会把整轮会话拖死，车机 ~15s 拆 BT 后 AirPlay 窗口关闭。
+        // 恢复手段（specifier 挂起同款，实测有效）：release → 重发一次请求。
+        if (!connectCancelled) {
+            appendLog("WIFI: 静默路径首次绑定无回调——重发网络请求（挂起形态，重发可恢复）")
+            val reBound = bindCarWifiAndRegister(wifi.ssid)
+            val reNetwork = connector.currentNetwork
+            if (reBound && reNetwork != null) {
+                appendLog("WIFI: 重发后绑定成功（$reNetwork）")
+                return WifiCarPlayConnector.JoinResult.Joined(reNetwork)
+            }
+        }
+        appendLog(
+            "WIFI: 静默路径绑定未成功（SSID 已连上但网络句柄未回调）——" +
+                "返回失败交由上层决定（specifier/近路）",
+        )
+        return WifiCarPlayConnector.JoinResult.Unavailable
     }
 
     /** WLAN 关着时经 Shizuku 直接打开（`cmd wifi set-wifi-enabled`），返回是否已开启。 */
@@ -1639,6 +1790,117 @@ object SessionController {
     // ---- 以下方法体自 MainActivity 原样迁入（会话逻辑不依赖 Activity）----
 
     /**
+     * 蓝牙音频旁路：连接车机本体的 A2DP，让手机声音走系统蓝牙（绕过 AirPlay 音频）。
+     *
+     * 2026-10-26 别克威朗 2020 + SmartBox 盒子场景：盒子的 AirPlay 音频通道对 YCast
+     * 固件不兼容（RAW/ADTS 实测均整链 RST），而车机本体（myBuick）是标准蓝牙音箱。
+     * 画面上 iAP2 连盒子、声音上 A2DP 连车机本体——两条链路是两个不同蓝牙设备，
+     * 互不干扰。
+     *
+     * 目标解析顺序：手动设置（[BluetoothAudioPrefs]）→ 自动探测（排除 iAP2 目标
+     * 设备后，在已配对设备里找 Class of Device 为音频类的车机）。会话建立后调用；
+     * 连接是异步的（系统建链 + 车机应答），只发起不阻塞。
+     */
+    private fun startBluetoothAudioRoute(
+        context: Context,
+        target: BluetoothAudioPrefs.Target?,
+    ) {
+        Bg.run("bt-audio-route") {
+            val resolved =
+                target ?: autoDetectCarAudioTarget(context)
+            if (resolved == null) {
+                appendLog(
+                    "BT-AUDIO: 未设置蓝牙音频目标且自动探测失败——" +
+                        "请到 设置→显示→蓝牙音频旁路 选择车机本体（如 myBuick）",
+                )
+                return@run
+            }
+            val device = BtAudioRoute.bondedDevice(context.applicationContext, resolved.address)
+            if (device == null) {
+                appendLog(
+                    "BT-AUDIO: 蓝牙音频目标「${resolved.name}」(${resolved.address}) 不在已配对列表" +
+                        "——请先系统蓝牙配对车机本体",
+                )
+                return@run
+            }
+            // 连接前先断开 CarPlay 盒子的音频配置文件（若盒子意外建立了 A2DP），
+            // 避免系统把媒体音频路由到盒子而非车机本体。盒子通常没有 A2DP，
+            // 此调用是防御性的。
+            BtAudioRoute.connectA2dp(context.applicationContext, device, ::appendLog)
+        }
+    }
+
+    /**
+     * 自动探测车机本体的蓝牙（手动设置优先的兜底）：
+     * 排除当前 iAP2 目标（CarPlay 盒子），在已配对设备里优先按
+     * 「Class of Device 为音频/视频类（0x400）」+ 名称含 buick/别克/car 挑选。
+     */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun autoDetectCarAudioTarget(context: Context): BluetoothAudioPrefs.Target? {
+        val adapter =
+            try {
+                (context.getSystemService(Context.BLUETOOTH_SERVICE) as android.bluetooth.BluetoothManager)
+                    .adapter
+            } catch (_: Exception) {
+                null
+            } ?: return null
+        val bonded =
+            try {
+                adapter.bondedDevices?.toList().orEmpty()
+            } catch (_: SecurityException) {
+                emptyList()
+            }
+        val iap2Target = TargetDevicePrefs.get(context)
+        val candidates =
+            bonded
+                .filter { device ->
+                    // 排除 CarPlay 盒子自身（iAP2 目标设备）
+                    iap2Target == null || !TargetDevicePrefs.matches(iap2Target, device.address)
+                }
+                .filter { device ->
+                    // Class of Device 的 Major 类为音频/视频（0x400）——车机/音箱是这类；
+                    // 耳机（0x2404 wearable）也常是这类，因此配合名称二次加权
+                    val cod =
+                        try {
+                            device.bluetoothClass?.majorDeviceClass
+                        } catch (_: SecurityException) {
+                            null
+                        }
+                    cod == android.bluetooth.BluetoothClass.Device.Major.AUDIO_VIDEO
+                }
+        if (candidates.isEmpty()) return null
+        val name =
+            candidates.firstOrNull { device ->
+                (device.name ?: "").lowercase().contains("buick") ||
+                    (device.name ?: "").lowercase().contains("car") ||
+                    (device.name ?: "").contains("别克")
+            } ?: candidates.first()
+        val target =
+            BluetoothAudioPrefs.Target(
+                address = name.address,
+                name = name.name ?: name.address,
+            )
+        // 自动探测结果持久化：下次连接直接命中，不再走探测
+        BluetoothAudioPrefs.set(context.applicationContext, target)
+        appendLog(
+            "BT-AUDIO: 自动探测到车机本体「${target.name}」(${target.address})——" +
+                "已设为蓝牙音频目标（声音走 A2DP）",
+        )
+        return target
+    }
+
+    /** 会话结束/手动断开时收口：断开蓝牙音频旁路的 A2DP，让手机音频回到本机。 */
+    private fun disconnectBluetoothAudioRoute(context: Context) {
+        val target = appContext?.let { BluetoothAudioPrefs.get(it) } ?: return
+        Bg.run("bt-audio-route-stop") {
+            val device = BtAudioRoute.bondedDevice(context.applicationContext, target.address)
+            if (device != null) {
+                BtAudioRoute.disconnectA2dp(context.applicationContext, device, ::appendLog)
+            }
+        }
+    }
+
+    /**
      * 音频通道（手机 → 车机，RTP over UDP）：SETUP type=100 协商 → 播放捕获 → ChaCha 封包推流。
      *
      * 依赖 MediaProjection（AudioPlaybackCapture 的授权来源），且需用户在「启动连接」
@@ -1654,6 +1916,22 @@ object SessionController {
     ): Boolean {
         if (!audioEnabledForSession) {
             appendLog("AUDIO: 本次连接未开启车机侧声音（「启动连接」弹窗选择）——仅推视频")
+            return false
+        }
+        // YCast 软件盒子（SmartBox-A703 等）没有可用的 AirPlay 音频通路：
+        // RAW/ADTS 两种封装实测都被整链 RST（盒子消费率 ~1%、controlPort 秒关），
+        // 且每轮音频尝试都会把稳定的视频会话一起拆掉——音频是毒药，不是功能。
+        // 声音改走蓝牙 A2DP 旁路（车机本体），见 startBluetoothAudioRoute。
+        val info = client.negotiatedInfoSnapshot
+        if (SecondLinkMemory.looksLikeSoftwareDongle(
+                info?.get("manufacturer") as? String,
+                info?.get("model") as? String,
+            )
+        ) {
+            appendLog(
+                "AUDIO: 软件盒子（YCast 类）没有可用 AirPlay 音频通路（RAW/ADTS 实测均拆链）" +
+                    "——跳过 AirPlay 音频，声音走蓝牙 A2DP 旁路（车机本体）",
+            )
             return false
         }
         if (sharedSecret == null) {
@@ -1677,8 +1955,6 @@ object SessionController {
         return try {
             // 车机身份 → 只用于「本车机哪些音频档位踩过雷」的持久化记忆。
             val identity = client.receiverIdentity()
-            // 音频封装参数已定案（见 AudioTuning），不再提供切换
-            val tuning = AudioTuning.RAW_SPF
             val entry = AudioProfileMemory.load(context.applicationContext, identity)
             if (entry.disabled) {
                 // 以前「全部档位都导致拆链」会自动退成只推视频，并要用户去弹窗里手点
@@ -1696,7 +1972,7 @@ object SessionController {
             appendLog(
                 "AUDIO: 音频档位候选=${ordered.map { it.label }}" +
                     "（本车机记忆：${AudioProfileMemory.describe(entry)}；" +
-                    "封装=${tuning.detail}）",
+                    "封装随档位（RAW/ADTS 双展开），按记忆排序轮换）",
             )
             // SETUP 失败不会扰动会话（车机只是不接这条流的请求），所以本会话内就把候选
             // 试完，不必等下一次连接。这一点对当前场景很关键：102/AAC-LC 与 100/PCM 是
@@ -1704,7 +1980,8 @@ object SessionController {
             var chosen: AudioProfile? = null
             var streamInfo: AirPlayClient.AudioStreamInfo? = null
             for (candidate in ordered) {
-                val result = client.runAudioStream(sharedSecret, candidate, tuning)
+                // 封装参数来自档位本身（RAW/ADTS 已展开为不同候选，记忆按各自 key 记）
+                val result = client.runAudioStream(sharedSecret, candidate, candidate.tuning)
                 if (result != null) {
                     chosen = candidate
                     streamInfo = result
@@ -1740,7 +2017,7 @@ object SessionController {
                     sampleRate = audio.sampleRate,
                     codec = profile.codec,
                     streamType = profile.streamType,
-                    adtsFrames = tuning.adts,
+                    adtsFrames = profile.tuning.adts,
                     // 同步包目标端口：车机在 SETUP 应答里下发。缺了它就没有 RTP↔NTP 锚点，
                     // 接收端只能「按到达时刻猜」，严格的实现干脆不排播（2026-10-20 实测）。
                     controlPort = audio.controlPort,
@@ -1834,13 +2111,18 @@ object SessionController {
         }.getOrDefault(emptySet())
 
     /**
-     * modesChanged 资源重申调度（MIB3 控制会话完成事件驱动）。
+     * modesChanged 资源重申调度（隧道控制会话完成事件驱动）。
      *
      * AADisplay r17 在奥迪上长播验证的时序：auth+burst 之后 **+1.5s 首发、+4s/+12s/
      * +30s 各重申一次**（绝对时刻）。声明若落在 0xAA00/0xAA05 进行中，会与 iAP POST
      * 抢控制通道、奥迪 ~12s 后死（AADisplay 注释原话）——所以只能由 burst 完成事件
      * 触发，不能在会话建立时一次性发完。082446 定谳：第二控制会话会重置车机的资源
      * 仲裁，早先那份 200 OK 的声明到订阅簇完成时已经失效，车机在等一份新的。
+     *
+     * 注：2026-10-27 曾尝试把触发点扩展到「RECORD 后」（以为软件盒子拆链是缺重申），
+     * 被 13:46 轮证伪（加了重申反而 5.95s 拆、比不加的 7.4s 更早）——软件盒子的拆链
+     * 根因是缺 disableBluetooth + 隧道 handoff（见 AGENTS.md 软件盒子条目），与
+     * modesChanged 无关。故触发点保持在「隧道控制会话完成」。
      */
     @Volatile
     private var modesReclaimEpoch = 0L
@@ -2615,7 +2897,12 @@ object SessionController {
                                     "changeModes" -> {
                                         // 车机请求资源仲裁（如用户在 MMI 上点了手机）：
                                         // 回 modesChanged 声明手机持有主屏/主音频
-                                        appendLog("EVENT: 车机请求 changeModes → 回 modesChanged 接管资源")
+                                        val paramsText =
+                                            (command["params"] as? Map<*, *>)
+                                                ?.entries
+                                                ?.joinToString(" ") { (k, v) -> "$k=$v".take(240) }
+                                                ?.take(600)
+                                        appendLog("EVENT: 车机请求 changeModes → 回 modesChanged 接管资源 params=$paramsText")
                                         client.assertModes()
                                     }
 
@@ -2638,6 +2925,13 @@ object SessionController {
                             }
                             // 资源声明（must）：真车对未声明资源的屏幕流 SETUP 直接 400
                             client.assertModes()
+                            // 第二链路门禁（MIB3 marker 协商 + iAP 隧道，2026-10-26 SmartBox-A703 定谳）：
+                            // 软件盒子没有第二链路状态机，marker/隧道 SETUP 会让它 RST 整链
+                            // （RECORD 前发必死）。决策优先级：用户强制关 > 该车机的 fatal 记忆 >
+                            // 自动策略（CLASSIC_MIB3 需要 / YCast 类软件盒子跳过）。
+                            // 必须在 runScreenStream 之前注入——armMib3VirtualLink 在
+                            // 屏幕 SETUP 200 应答里就触发。
+                            applySecondLinkGate(client)
                             // HID 输入模式武装：/info hidDevices（奥迪字符串 "0"/"1"，触摸="1"）。
                             // display features=0x08（高保真触摸）已声明，缺这步车机不发 hidSendReport。
                             setup.hidDeviceUuids.forEach { uuid ->
@@ -2656,22 +2950,6 @@ object SessionController {
                                     client.startKeepAlive(host, setup.keepAlivePort!!)
                                 }
                                 client.startFeedbackLoop()
-                                // iAP 隧道（type-130）：车机→手机的 iAP2 EA 数据（触摸 HID 载体）。
-                                // 建立失败不阻塞会话（触摸不可用但视频照常）。
-                                val tunnel = client.runIapTunnel(sessionKey)
-                                tunnel?.onIapMessage = { frame ->
-                                    // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
-                                    if (frame.messageId != 0x0000) {
-                                        val hex = frame.body.joinToString(" ") { "%02x".format(it) }
-                                        appendLog(
-                                            "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
-                                                "(${Iap2MessageIds.nameOf(
-                                                    frame.messageId,
-                                                )}) ${frame.body.size}B" +
-                                                if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
-                                        )
-                                    }
-                                }
                                 // 关键时序（2026-10-17 奥迪定谳）：屏幕 SETUP 后必须尽快连上
                                 // dataPort——车机有 ~2s 看门狗。音频 SETUP 实测要 ~2.1s，
                                 // 若排在前面，端口连接迟到即触发车机 reset 控制通道
@@ -2765,6 +3043,9 @@ object SessionController {
                                                 // 音频拆链归因：起过音频却很快被拆 → 记下该档位
                                                 // 不兼容，下次连接自动换档（见 attributeAudioTeardown）。
                                                 attributeAudioTeardown()
+                                                // 第二链路拆链归因：布防了但控制会话没完成即被拆
+                                                // → 记 fatal，下次自动跳过（见 attributeSecondLinkTeardown）。
+                                                currentClient?.let { attributeSecondLinkTeardown(it) }
                                             },
                                         )
                                     // 先连端口（车机看门狗），编码器等 RECORD 后再启动
@@ -2778,6 +3059,40 @@ object SessionController {
                                 //   屏幕 SETUP → 连数据端口 → RECORD → 起编码器（出帧）→ 音频 SETUP
                                 // 音频 SETUP 失败只丢声音，视频会话保持。
                                 client.record()
+                                // 蓝牙 iAP2 交接（2026-10-27 SmartBox-A703 定谳）：软件盒子（有线转无线
+                                // 中转）必须走真 iPhone 标准流程——RECORD 后发 disableBluetooth 再建
+                                // type-130 隧道，盒子才能把 iAP2 从蓝牙迁移到 WiFi、转发给车机有线侧。
+                                // 此前代码库从未发过 disableBluetooth（grep 仅命中无关日志），盒子在
+                                // RECORD 后一直等 handoff、等到看门狗超时即拆整轮会话（实测 6~12s 必拆、
+                                // 与 marker/隧道/音频/modesChanged 全部无关）。真车（DiPlay/奥迪）同样
+                                // 走此交接——DiPlay CarPlayController 收到 disableBluetooth 才置
+                                // handoffRequested、武装「等隧道 iAP2 就绪」看门狗。
+                                val handoffAccepted = client.sendDisableBluetooth()
+                                appendLog(
+                                    "AIRPLAY: 蓝牙交接 disableBluetooth 结果=${if (handoffAccepted) "已接受" else "未接受/失败"}（接下来建 type-130 隧道）",
+                                )
+                                // iAP 隧道（type-130）：车机→手机的 iAP2 EA 数据（触摸 HID 载体）。
+                                // 建立失败不阻塞会话（触摸不可用但视频照常）。
+                                // **必须排在 RECORD 之后、disableBluetooth 之后**（2026-10-26 SmartBox
+                                // 定谳：隧道 SETUP 排在 RECORD 前会让没有该状态机的盒子在窗口内 RST 整链、
+                                // RECORD 永远发不出；正确顺序是 RECORD → disableBluetooth → 隧道）。
+                                val tunnel = client.runIapTunnel(sessionKey)
+                                appendLog(
+                                    "AIRPLAY: 蓝牙交接隧道结果=${if (tunnel != null) "已建立" else "未建立（触摸不可用，视频不受影响）"}",
+                                )
+                                tunnel?.onIapMessage = { frame ->
+                                    // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
+                                    if (frame.messageId != 0x0000) {
+                                        val hex = frame.body.joinToString(" ") { "%02x".format(it) }
+                                        appendLog(
+                                            "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
+                                                "(${Iap2MessageIds.nameOf(
+                                                    frame.messageId,
+                                                )}) ${frame.body.size}B" +
+                                                if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
+                                        )
+                                    }
+                                }
                                 if (host != null) {
                                     val videoW = pendingVideoW
                                     val videoH = pendingVideoH
@@ -2813,16 +3128,39 @@ object SessionController {
                                         }
                                     }
                                 }
-                                // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
+                                // 音频通道（二选一）：
+                                //  A) 软件盒子（YCast）→ 蓝牙 A2DP 旁路（自动探测车机本体，无需手动设置）
+                                //  B) 蓝牙旁路手动设置 → 直接走 A2DP
+                                //  C) 其余（真车）→ AirPlay 音频：SETUP type=100/102 → RTP 推流。
                                 // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
-                                val audioStarted = startAudioChannel(context, client, sessionKey, host)
-                                if (audioStarted) {
-                                    // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
-                                    // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
-                                    // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
-                                    // 音频包持续发送、采集内容非零，车机无声）。
-                                    appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
-                                    client.record()
+                                val btAudioTarget = appContext?.let { BluetoothAudioPrefs.get(it) }
+                                val ycastBox =
+                                    SecondLinkMemory.looksLikeSoftwareDongle(
+                                        client.negotiatedInfoSnapshot?.get("manufacturer") as? String,
+                                        client.negotiatedInfoSnapshot?.get("model") as? String,
+                                    )
+                                if (audioEnabledForSession && ycastBox) {
+                                    appendLog(
+                                        "AUDIO: 软件盒子（YCast）——声音走蓝牙 A2DP 旁路" +
+                                            "（跳过 AirPlay 音频，避免音频拆链拖死视频会话）",
+                                    )
+                                    startBluetoothAudioRoute(context, btAudioTarget)
+                                } else if (btAudioTarget != null && audioEnabledForSession) {
+                                    appendLog(
+                                        "AUDIO: 蓝牙音频旁路已启用（车机本体「${btAudioTarget.name}」）" +
+                                            "——跳过 AirPlay 音频，声音走系统蓝牙 A2DP",
+                                    )
+                                    startBluetoothAudioRoute(context, btAudioTarget)
+                                } else {
+                                    val audioStarted = startAudioChannel(context, client, sessionKey, host)
+                                    if (audioStarted) {
+                                        // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
+                                        // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
+                                        // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
+                                        // 音频包持续发送、采集内容非零，车机无声）。
+                                        appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
+                                        client.record()
+                                    }
                                 }
                             }
                         } else {

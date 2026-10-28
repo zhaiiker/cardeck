@@ -65,11 +65,47 @@ class AacLcEncoderTest {
     }
 
     @Test
-    fun tuningIsFixedToRawFrames() {
-        // 定案：裸 AAC 帧 + spf=1024 + 到达时间戳，只有这一组，不再提供切换
-        assertEquals(1, AudioTuning.entries.size)
+    fun tuningVariantsForDongles() {
+        // 2026-10-26 重新开放轮换（YCast 盒子只认 ADTS）：RAW 是真车验证的默认，
+        // ADTS 是软件盒子通路——两组并存、按车机记忆排序轮换（详见 AudioTuning 文档）
+        assertEquals(2, AudioTuning.entries.size)
         assertTrue(!AudioTuning.RAW_SPF.adts)
         assertEquals(1024, AudioTuning.RAW_SPF.spf)
         assertTrue(!AudioTuning.RAW_SPF.highAccuracyTimestamps)
+        assertTrue(AudioTuning.ADTS_SPF.adts)
+        assertEquals(1024, AudioTuning.ADTS_SPF.spf)
+        assertTrue(!AudioTuning.ADTS_SPF.highAccuracyTimestamps)
+    }
+
+    @Test
+    fun profileKeySeparatesTunings() {
+        // 同一档 AAC 在 RAW/ADTS 两封装下是不同通路：记忆键必须分开，
+        // 否则 RAW 被拒的结论会错误地连坐 ADTS（下次直接不试）
+        val raw =
+            AudioProfile(
+                "media", (1L shl 23), 48_000, 250L,
+                streamType = 102L, codec = AudioCodec.AAC_LC,
+                tuning = AudioTuning.RAW_SPF,
+            )
+        val adts = raw.copy(tuning = AudioTuning.ADTS_SPF)
+        assertTrue(raw.key != adts.key)
+        assertTrue(raw.key.endsWith("|RAW_SPF"))
+        assertTrue(adts.key.endsWith("|ADTS_SPF"))
+        // PCM 档不受封装维度影响（无 AAC 帧可封装）
+        val pcm = AudioProfile("media", (1L shl 15), 48_000, 250L)
+        assertTrue(pcm.key.endsWith("PCM"))
+    }
+
+    @Test
+    fun profileLabelIncludesTuning() {
+        val raw =
+            AudioProfile(
+                "media", (1L shl 23), 48_000, 250L,
+                streamType = 102L, codec = AudioCodec.AAC_LC,
+            )
+        val adts = raw.copy(tuning = AudioTuning.ADTS_SPF)
+        // 日志标签必须能一眼区分两种封装（排查「收包无声」时按标签对号入座）
+        assertTrue(raw.label.contains("RAW"))
+        assertTrue(adts.label.contains("ADTS"))
     }
 }

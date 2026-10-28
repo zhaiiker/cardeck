@@ -71,7 +71,8 @@ class AudioProfileMemoryTest {
         // 键里同时带流类型与编码：同格式在 102/AAC 与 100/PCM 上是完全不同的通路
         assertEquals("100|media|2048|PCM", AudioProfile("Media", 1L shl 11, 44_100, 250).key)
         assertEquals(
-            "102|media|4194304|AAC_LC",
+            // AAC 键追加封装维度（2026-10-26 YCast：RAW/ADTS 是两条不同通路，记忆必须分开）
+            "102|media|4194304|AAC_LC|RAW_SPF",
             AudioProfile(
                 "media",
                 1L shl 22,
@@ -79,6 +80,18 @@ class AudioProfileMemoryTest {
                 250,
                 streamType = 102L,
                 codec = AudioCodec.AAC_LC,
+            ).key,
+        )
+        assertEquals(
+            "102|media|4194304|AAC_LC|ADTS_SPF",
+            AudioProfile(
+                "media",
+                1L shl 22,
+                44_100,
+                250,
+                streamType = 102L,
+                codec = AudioCodec.AAC_LC,
+                tuning = AudioTuning.ADTS_SPF,
             ).key,
         )
     }

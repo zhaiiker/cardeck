@@ -54,7 +54,7 @@ class AudioSender(
     private val codec: AudioCodec = AudioCodec.PCM,
     /** RTP 流类型，仅用于日志（PT 与 SETUP 的 type 保持一致）。 */
     private val streamType: Long = 100L,
-    /** AAC 帧是否补 ADTS 头（见 [AudioTuning.ADTS]，排查车机解码链用）。 */
+    /** AAC 帧是否补 ADTS 头（见 [AudioTuning.ADTS_SPF]，排查车机解码链用）。 */
     private val adtsFrames: Boolean = false,
     /**
      * 该音频流的控制端口（车机在 SETUP 应答里下发）。>0 时每 [SYNC_INTERVAL_MILLIS]

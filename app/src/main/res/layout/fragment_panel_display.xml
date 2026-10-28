@@ -190,6 +190,92 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
+            android:text="第二链路（MIB3 协商 + iAP 隧道）"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_segment"
+            android:orientation="horizontal"
+            android:padding="3dp">
+
+            <TextView
+                android:id="@+id/btnSecondLinkAuto"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_segment_sel"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="自动"
+                android:textColor="#FFFFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnSecondLinkForceOff"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="2dp"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="强制关"
+                android:textColor="#FF8E8E93"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/secondLinkNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="自动：按车机画像决定（奥迪 MIB3 需要；CarPlay 盒子自动跳过）。强制关：所有车机都不发第二链路——排查「连上即断」用；真车（奥迪）会被约 10 秒拆链，仅排障时开启。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="蓝牙音频旁路（车机本体出声）"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/btnBtAudioPick"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_segment"
+            android:paddingLeft="18dp"
+            android:paddingTop="8dp"
+            android:paddingRight="18dp"
+            android:paddingBottom="8dp"
+            android:text="未设置——点击选择车机蓝牙"
+            android:textColor="#FFF5F5F7"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btAudioNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="用 CarPlay 盒子出画面、车机自带蓝牙出声音（绕开盒子音频兼容问题与 app 禁止播放捕获的限制）。选择的车机本体需先在系统蓝牙里配对。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
             android:text="流分辨率"
             android:textColor="#FFF5F5F7"
             android:textSize="14sp" />

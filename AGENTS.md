@@ -1038,6 +1038,110 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   只靠长度会把 telephony 的 usage 0xB3 当成「快进」误发。描述符缺失时才回退长度判据。
   ③ 判定实现均有单测钉死语义（`ConsumerKeysTest` / `TouchReportsTest`，含奥迪与
   DiPlay 两套真实描述符），改这些解析器先看测试。
+- **软件盒子（YCast 类）没有第二条 iAP2 链路，第二链路要在屏幕 SETUP 前门禁**
+  （2026-10-26 SmartBox-A703 定谳，八轮同点失败 + 首次 RECORD 成功对照）：
+  这类「有线转无线」盒子自报 `model=YCast, fv=WifiCP0.1, manufacturer=Samuncle,
+  srcvers=320.17.6, OSInfo=Android8`（iAP2 清单 wifiGen=LEGACY）。它在「屏幕流
+  SETUP 200 → RECORD」窗口内收到 **MIB3 DETECT marker**（控制通道 iAPSendMessage，
+  载荷恰好是它自己的保活字节 `ff 55 02 00 ee 10`）或 **type-130 隧道 SETUP**
+  （它每次回 streams=null）后 ~5-100ms 把事件/控制/数据口**全部 RST**——RECORD
+  永远发不出、无限循环。修复三件套：① `SecondLinkMemory`（按车机身份持久 fatal
+  记忆 + `looksLikeSoftwareDongle` 识别 model=YCast/WifiCP）在 `runScreenStream`
+  **之前**注入门禁（armMib3VirtualLink 在屏幕 SETUP 200 同步路径触发，晚注入
+  等于没拦）；② **iAP 隧道移到 RECORD 之后**（真 iPhone 也是先 RECORD 后触摸，
+  对 DiPlay/奥迪语义不变）；③ 设置→显示「第二链路：自动/强制关」开关供 A/B。
+  识别判据只锚 /info 的 model/固件串（能力信号，不碰品牌名）。修复后首次
+  `✓ RECORD 完成` 并稳定推流 11s——11s 后的拆链是**音频档位**问题（见下条），
+  视频链路已通。
+- **软件盒子的音频档位逐档自学习会自己收敛；采集全零是 app 禁止播放捕获（无解）**
+  （2026-10-26 SmartBox 实测）：盒子的 audioFormats 位图全是 `0xf000000`（bit24-27，
+  AAC-ELD 区域）与 `0x800000`（bit23=AAC-LC 48k）——**没有任何 PCM 档**。
+  `t102/media AAC-LC` 起流 9.2s 被拆 → `AudioProfileMemory` 记 rejected，下轮自动
+  换档；全部档位试完置 disabled 只推视频（读回确认：`rejected_samuncle_ycast=
+  102|media|8388608|AAC_LC`）。另 `AudioPlaybackCapture` 在 Spotify 等声明
+  `allowAudioPlaybackCapture=false` 的 app 上**采集恒为零**（日志「全零：捕获不到
+  音频」）——无 root 无解，root 直取 HAL 的路线见 `docs/ROOT-ENHANCEMENTS.md` 2.1。
+- **音频封装不是全局唯一解——「裸帧 vs ADTS」要按车机轮换，YCast 盒子只认 ADTS**
+  （2026-10-26 SmartBox-A703 定谳，推翻了 2026-10-20 Honda 的「唯一组合」结论）：
+  2026-10-20 Honda 定案时把 `AudioTuning` 收敛成唯一组合（裸帧+spf=1024+到达时间戳），
+  理由是「严格实现两种封装都接受」。SmartBox 实测证伪：它 SETUP 回 200、给
+  dataPort/controlPort、收 UDP、但 `/feedback` 的 `sampleTime` **几乎不推进**
+  （5s 只走 3210 样本，48k 应走 240000——消费率 1.3% 欠载）、`controlPort` 起流
+  ~0.9s 就 ECONNREFUSED、~9s 后整链 RST。CarPlay 主音频在规范上本就是
+  AAC-over-ADTS 流（社区逆向一致），YCast 软件盒子（自报 Android8）的解码链按
+  ADTS 组织，裸帧被判非帧。修法：`AudioTuning` 重新开放成 `RAW_SPF`/`ADTS_SPF`
+  两个枚举，`AudioProfile` 增 `tuning` 字段并**参与记忆键**（同一档位 RAW/ADTS
+  是两条不同通路，RAW 被拒不能连坐 ADTS）；`AirPlayClient.audioCandidates` 对每个
+  AAC 档 `AudioTuning.entries.forEach` 展开双变体，`startAudioChannel` 用
+  `candidate.tuning`（替代写死的 `AudioTuning.RAW_SPF`），`AudioSender.adtsFrames`
+  取 `profile.tuning.adts`。**教训**：任何「按接收端实测定案成唯一值」的协议参数，
+  拿到反例（YCast 盒子）后都要重新开放成按车机记忆轮换，不要迷信「唯一解」。
+  单测：`AacLcEncoderTest` 的 tuning 断言从 1 个枚举改成 2 个；`AudioProfileMemoryTest`
+  的 AAC 键断言加 `|RAW_SPF`/`|ADTS_SPF` 后缀。
+- **root 增强落地（P0）：RootGate 三态 + 连接时静默加速，全部带降级链路**
+  （2026-10-26，完整路线图 `docs/ROOT-ENHANCEMENTS.md`）：手机已 root（Magisk）时
+  `startConnection` 后台跑 `RootGate.applyConnectionBoosts`：
+  ① `cmd wifi network-requests-set-user-approved <pkg> yes`（**root 专属**，uid 2000
+  SecurityException，WIFI-JOIN.md §2）——specifier 不再弹系统确认框。**本 ROM
+  help 实测标注 `Not persisted`（WiFi 服务重启/开机即失效）→ 每次连接都要重新
+  下发**，且全局单值（挤掉其它应用的批准）；下发后 `has-user-approved` 读回校验
+  （`RootGate.approvalConfirmed`，单测钉死）。
+  ② `cmd deviceidle whitelist +<pkg>`（**持久**，进程内只做一次）。
+  `su -c true` 探测：exit 0=READY / 127=NO_ROOT（su 不存在）/ 其它=UNAUTHORIZED
+  （不缓存，用户可能稍后才授权）；READY/NO_ROOT 进程内缓存；拒绝超 3 次静默放弃。
+  **root 只是可选加速**：探测失败/无 root 全部静默降级到 Shizuku 路径，无 root
+  用户不退化。后续 P1（HAL 音频内录）/P2（常驻）/P3（root 版 UserService）见文档。
+- **Android Auto（`com.google.android.projection.gearhead`）与盒子抢蓝牙 iAP2 通道**
+  （2026-10-26 用户报告「不卸载无法使用」）：`pm uninstall --user 0` 后系统分区
+  包仍在，需再 `pm disable-user --user 0` + `pm clear` 才彻底（本机 root 用 su 执行）。
+- **蓝牙音频旁路：画面走 CarPlay 盒子、声音走车机本体 A2DP（两设备两链路）**
+  （2026-10-26 某车型 + SmartBox-A703 盒子场景落地，`bt/BtAudioRoute.kt` +
+  `bt/BluetoothAudioPrefs.kt`）：有线转无线盒子的 AirPlay 音频通道对 YCast 固件
+  不兼容，而车机本体（如某车型的车载蓝牙本体，cod=3400-4-8，SDP 有 `0000110b`
+  AudioSink）是标准蓝牙音箱。方案：**声音不经过 AirPlay，直接让手机系统蓝牙
+  A2DP 连车机本体放声音**——iAP2 连盒子（画面）、A2DP 连车机本体（声音）是两个
+  不同蓝牙设备，互不干扰，且绕过 `allowAudioPlaybackCapture=false` 限制（Spotify
+  也照常出声）。实现要点：
+  ① A2DP 的 `connect(device)` 是 @SystemApi，反射调用（运行时只要求
+  BLUETOOTH_CONNECT）；`getProfileProxy(A2DP)` 回调经主线程 Handler——**不能主线程
+  调用**（同 BtProfiles.proxy 教训）；② 与「只配对、不连接」的 `BtProfiles` 不冲突：
+  后者只断开**要连 iAP2 的那台设备**（盒子）的 HFP/A2DP，盒子本就没有这些配置，
+  车机本体的 A2DP 不在断开范围；③ 设置→显示「蓝牙音频旁路」选车机本体（非盒子/
+  耳机），会话建立后 `SessionController.startBluetoothAudioRoute` 后台连 A2DP、
+  `disconnect`/会话结束 `disconnectBluetoothAudioRoute` 断开收口；④ 旁路启用时
+  `startAudioChannel` 被跳过（不再发 AirPlay 音频 SETUP/RTP），`audioEnabledForSession`
+  仍控制是否出声（用户选「仅推视频」就不连 A2DP）。**通用性**：任何「盒子画面 +
+  原厂车机蓝牙」的组合都可用此方案，是比调 AirPlay 音频更稳的声音通路。
+  **2026-10-26 晚二次定谳（音频毒药 + 自动旁路）**：SmartBox 五轮实测证明
+  **AirPlay 音频对 YCast 盒子是毒药不是功能**——RAW 起流 2s 拆、ADTS 起流 10s 拆
+  （`sampleTime` 几乎不推进、controlPort 秒关 ECONNREFUSED），且**每轮音频尝试都
+  把本来稳定的视频会话一起 RST**（「视频+声音」模式永远 10 秒内必断）。因此：
+  ① `startAudioChannel` 对 `looksLikeSoftwareDongle` 直接 return（不再试任何档位，
+  终结 RAW/ADTS「照常全试」的循环）；② 蓝牙旁路目标**自动探测**（
+  `autoDetectCarAudioTarget`：排除 iAP2 目标设备后，在已配对设备里按
+  `bluetoothClass.majorDeviceClass == AUDIO_VIDEO` 过滤，优先名称含 buick/car/别克，
+  结果持久化到 BluetoothAudioPrefs）——用户无需手动设置；③ 软件盒子 + 开启声音 →
+  直接走 A2DP 旁路（不再要求手动设置蓝牙目标）。
+- **软件盒子「秒断」真正根因：蓝牙 ACL 断开被误判成「下车」**（2026-10-27 定谳，
+  推翻了「缺 disableBluetooth」与「盒子看门狗」两个更早的归因）：加了
+  disableBluetooth + 日志后，14:10 轮暴露了完整时序——RECORD 后盒子**主动关蓝牙
+  iAP2 socket**（handoff 的正常行为：蓝牙 iAP2 退役、改走 WiFi），这触发了
+  `CarBluetoothReceiver` 的 `ACTION_ACL_DISCONNECTED` → 被误判成「下车」→
+  `ACTION_AUTO_STOP_SESSION` → `SessionController.disconnect()` 拆掉**还在 WiFi 上
+  正常推流的视频会话**。之前所有「6~12s 拆链」都是这个误判——盒子关蓝牙 socket 的
+  时间点由它自己决定（没发 disableBluetooth 时 6~12s 才关、发了立即关 → 2s），所以
+  表现为「存活时间随配置波动」，实则全是「下车自动结束」拆的。修复：
+  `CarPlayService` 的 `ACTION_AUTO_STOP_SESSION` 处理里，先判
+  `SessionController.videoSender?.isRunning == true`（视频还在 WiFi 推流）= 蓝牙断开
+  是 handoff 不是下车 → 不拆。**关键认知**：① disableBluetooth 对盒子是**有效且必要**
+  的（它接受 200 OK、触发 handoff）；② 盒子的「第二链路」是**事件通道 marker 协商**
+  （MIB3 路径，14:10 轮完整成功：0x1d00→0x1d01→0xaa00→0xaa01→0xaa02(20B)→0xaa03→
+  0xaa05→突发→订阅 0x5000/0x4154），**不是** type-130 隧道（盒子隧道 SETUP 恒回
+  streams=null/空 dict，是真不支持）；③ 所以「type-130 隧道」对盒子必须跳过（门禁），
+  不能因为「真车要隧道」就对盒子也放开——14:10 轮放开后 type-130 SETUP 回空、反而
+  干扰了 handoff。**教训**：排查「会话秒断」先看是不是自家「下车自动结束」/看门狗
+  把正常 handoff 当成了掉线——蓝牙 iAP2 退役迁 WiFi 是无线 CarPlay 的**设计行为**，
+  不是故障。
 - **风格**：Kotlin，中文注释（注释写「为什么/实测依据」而非复述代码）；UI 文案中文。
   `reference/` 下是 GPL 参考仓库（gitignore，勿复制代码入本项目、勿外传）。
 

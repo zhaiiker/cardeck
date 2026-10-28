@@ -23,7 +23,7 @@ class AacLcEncoder(
     private val sampleRate: Int,
     private val channels: Int,
     private val bitRate: Int = 192_000,
-    /** 是否给每帧补 7 字节 ADTS 头（见 [AudioTuning.ADTS]）。 */
+    /** 是否给每帧补 7 字节 ADTS 头（见 [AudioTuning.ADTS_SPF]）。 */
     private val wrapAdts: Boolean = false,
     private val log: (String) -> Unit,
 ) {
@@ -48,7 +48,7 @@ class AacLcEncoder(
          *
          * 线上报文（RTP 负载）按 Apple 的约定是**裸 AAC 帧**，但个别车机的解码链是
          * 按 ADTS 组织的（Android `audio/aac-adts`），裸帧喂进去会被判为非帧。
-         * 因此留一条可切换的封装路径（[AudioTuning.ADTS]）。
+         * 因此留一条可切换的封装路径（[AudioTuning.ADTS_SPF]）。
          */
         fun adtsHeader(
             payloadSize: Int,

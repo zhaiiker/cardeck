@@ -33,12 +33,21 @@ object DisplayPrefs {
     /** HID 原始报文日志默认值：默认关（校准键位时临时打开，避免刷屏）。 */
     const val HID_RAW_LOG_DEFAULT = false
 
+    /**
+     * 「第二链路」（MIB3 marker 协商 + iAP 隧道）强制关闭默认值：默认**开**（自动）。
+     * 自动策略下软件盒子（YCast 类）会被 SecondLinkMemory 识别并跳过；此开关是
+     * 用户/排障用的全局强制关——开启后所有车机都不布防第二链路（奥迪真车会因此
+     * ~10s 被拆，只用于排查）。
+     */
+    const val SECOND_LINK_OFF_DEFAULT = false
+
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"
     private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
+    private const val KEY_SECOND_LINK_OFF = "second_link_off"
 
     /**
      * HID 原始报文日志（键位校准用）：打开后每帧 `hidSendReport` 会写一行
@@ -123,6 +132,26 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getInt(KEY_MOVE_THROTTLE, MOVE_THROTTLE_DEFAULT)
             .coerceIn(0, MOVE_THROTTLE_MAX)
+
+    /**
+     * 第二链路（MIB3 marker 协商 + iAP 隧道）强制关闭：true = 所有车机都跳过
+     * 布防/隧道（排障用；奥迪真车会因此被看门狗拆链）。默认 false 走自动。
+     */
+    fun secondLinkOff(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SECOND_LINK_OFF, SECOND_LINK_OFF_DEFAULT)
+
+    fun setSecondLinkOff(
+        context: Context,
+        off: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SECOND_LINK_OFF, off)
+            .apply()
+    }
 
     fun setMoveThrottleMs(
         context: Context,

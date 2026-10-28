@@ -19,28 +19,48 @@ import java.util.concurrent.TimeUnit
 object ShizukuGate {
     enum class State { NOT_INSTALLED, NOT_RUNNING, UNAUTHORIZED, READY }
 
+    /** 运行时状态 → 引导文案输入（一一对应，见 [ShizukuGuidanceEnv]）。 */
+    fun toEnv(state: State): ShizukuGuidanceEnv = ShizukuGuidanceEnv.valueOf(state.name)
+
     /** Shizuku 授权请求码（授权结果回调按它过滤）。 */
     const val PERMISSION_REQUEST_CODE = 101
 
     /** Shizuku App 包名（打开/检测共用）。 */
     const val PACKAGE_NAME = "moe.shizuku.privileged.api"
 
+    /**
+     * Binder 是否存活（Shizuku App 与 Sui/Zygisk 实现共用同一 Binder 服务）。
+     *
+     * **Sui 没有 `moe.shizuku.privileged.api` 这个包**（它是 Zygisk 注入实现，
+     * 不装 Shizuku App），但 API 完全兼容——状态判定必须先探 binder 再查包名，
+     * 否则只装 Sui 的机器永远被判 NOT_INSTALLED，连接被硬拦（2026-10-26 用户报告）。
+     */
+    private fun binderAlive(): Boolean =
+        try {
+            rikka.shizuku.Shizuku.pingBinder()
+        } catch (_: Throwable) {
+            false
+        }
+
     fun state(context: Context): State {
-        return try {
-            context.packageManager.getPackageInfo(PACKAGE_NAME, 0)
-        } catch (_: PackageManager.NameNotFoundException) {
-            return State.NOT_INSTALLED
-        }.let {
-            try {
-                if (!rikka.shizuku.Shizuku.pingBinder()) return State.NOT_RUNNING
+        // binder 活着 = 服务在运行（Shizuku 或 Sui 任一实现），包名检查只是给
+        // 「服务没运行」的用户一个可打开的 App 而已——不能作为存在性判据。
+        if (binderAlive()) {
+            return try {
                 if (rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
                     State.READY
                 } else {
                     State.UNAUTHORIZED
                 }
             } catch (_: Throwable) {
-                State.NOT_RUNNING
+                State.UNAUTHORIZED
             }
+        }
+        return try {
+            context.packageManager.getPackageInfo(PACKAGE_NAME, 0)
+            State.NOT_RUNNING
+        } catch (_: PackageManager.NameNotFoundException) {
+            State.NOT_INSTALLED
         }
     }
 
@@ -57,31 +77,35 @@ object ShizukuGate {
      * 三种未就绪状态的**处置方式完全不同**（装/启动/授权），混成一句
      * 「Shizuku 未就绪」用户无从下手——这是共享给朋友后最容易被问住的地方。
      */
-    internal fun guidanceOf(state: State): ShizukuGuidance =
+    fun guidanceOf(state: ShizukuGuidanceEnv): ShizukuGuidance =
         when (state) {
-            State.NOT_INSTALLED ->
+            ShizukuGuidanceEnv.NOT_INSTALLED ->
                 ShizukuGuidance(
                     title = "需要先安装 Shizuku",
                     message =
                         "连接车机依赖 Shizuku 提供的 shell 权限：创建虚拟屏、注入触摸、" +
                             "读取窗口状态都要经过它。\n\n" +
                             "请先安装 Shizuku App 并按官方说明启动服务（无线调试激活，免 root），" +
-                            "完成后回到这里点「重试检查」。",
+                            "完成后回到这里点「重试检查」。\n\n" +
+                            "（有 Magisk/KernelSU 的 root 用户也可以改用 Sui 模块，" +
+                            "开机自动生效，无需每次手动启动。）",
                     primaryLabel = null,
                 )
 
-            State.NOT_RUNNING ->
+            ShizukuGuidanceEnv.NOT_RUNNING ->
                 ShizukuGuidance(
                     title = "Shizuku 服务未运行",
                     message =
                         "Shizuku 已安装，但服务当前没有运行，此时连接会失败" +
                             "（车机没有画面、触摸也不可用）。\n\n" +
                             "请打开 Shizuku App 点「启动」启动服务（手机重启后需要重新启动一次），" +
-                            "然后回来点「重试检查」。",
+                            "然后回来点「重试检查」。\n\n" +
+                            "（若使用的是 Sui/Zygisk 模块：它开机自动生效、无需启动，" +
+                            "请确认 Magisk 里该模块已启用并重启一次手机。）",
                     primaryLabel = "打开 Shizuku",
                 )
 
-            State.UNAUTHORIZED ->
+            ShizukuGuidanceEnv.UNAUTHORIZED ->
                 ShizukuGuidance(
                     title = "未授权本应用使用 Shizuku",
                     message =
@@ -92,12 +116,19 @@ object ShizukuGate {
                     primaryLabel = "请求授权",
                 )
 
-            State.READY -> ShizukuGuidance("Shizuku 就绪", "", null)
+            ShizukuGuidanceEnv.READY -> ShizukuGuidance("Shizuku 就绪", "", null)
         }
 }
 
+/**
+ * [ShizukuGate.guidanceOf] 的输入（与 [ShizukuGate.State] 同构；拆开是为了
+ * 让 guidanceOf 成为可单测的纯函数，不依赖 Android 运行时）。
+ */
+enum class ShizukuGuidanceEnv { NOT_INSTALLED, NOT_RUNNING, UNAUTHORIZED, READY }
+
+
 /** Shizuku 未就绪时的引导内容（见 [ShizukuGate.guidanceOf]）。 */
-internal data class ShizukuGuidance(
+data class ShizukuGuidance(
     val title: String,
     val message: String,
     /** null = 本机没有可执行的主操作（未安装时无处可跳）。 */

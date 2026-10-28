@@ -11,6 +11,7 @@ import android.widget.TextView
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.SessionController
 import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
+import io.github.shaonialife.cardeck.bt.BluetoothAudioPrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.AppIcons
 import io.github.shaonialife.cardeck.launcher.DefaultMapPrefs
@@ -693,6 +694,55 @@ class DisplayPanelFragment : SettingsPanelFragment() {
         hidRawOn.setOnClickListener { applyHidRaw(true) }
         hidRawOff.setOnClickListener { applyHidRaw(false) }
 
+        // 第二链路（MIB3 marker 协商 + iAP 隧道）：默认自动（按车机画像分派）；
+        // 强制关仅排障用（真车奥迪会因此 ~10s 被拆链）——见 SecondLinkMemory
+        val secondLinkAuto = view.findViewById<TextView>(R.id.btnSecondLinkAuto)
+        val secondLinkForceOff = view.findViewById<TextView>(R.id.btnSecondLinkForceOff)
+        var secondLinkOffPref = DisplayPrefs.secondLinkOff(ctx)
+
+        fun refreshSecondLink(off: Boolean) {
+            secondLinkAuto.setBackgroundResource(
+                if (off) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            secondLinkAuto.setTextColor(if (off) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+            secondLinkForceOff.setBackgroundResource(
+                if (off) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            secondLinkForceOff.setTextColor(if (off) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+        }
+
+        refreshSecondLink(secondLinkOffPref)
+
+        fun applySecondLink(off: Boolean) {
+            if (off == secondLinkOffPref) return
+            secondLinkOffPref = off
+            DisplayPrefs.setSecondLinkOff(ctx, off)
+            refreshSecondLink(off)
+            hostToast(
+                if (off) {
+                    "第二链路已强制关闭（下次连接生效；真车会被约 10 秒拆链）"
+                } else {
+                    "第二链路恢复自动（下次连接生效）"
+                },
+            )
+        }
+        secondLinkAuto.setOnClickListener { applySecondLink(false) }
+        secondLinkForceOff.setOnClickListener { applySecondLink(true) }
+
+        // 蓝牙音频旁路：选择车机本体蓝牙（声音走系统 A2DP，绕开盒子音频）
+        val btAudioPick = view.findViewById<TextView>(R.id.btnBtAudioPick)
+        fun refreshBtAudioTarget() {
+            val target = BluetoothAudioPrefs.get(ctx)
+            btAudioPick.text =
+                if (target == null) {
+                    "未设置——点击选择车机蓝牙"
+                } else {
+                    "已选「${target.name}」——点击更换"
+                }
+        }
+        refreshBtAudioTarget()
+        btAudioPick.setOnClickListener { showBtAudioPicker(view) }
+
         // 滑条 progress（0..26）→ 百分比（30..160，步进 5）
         fun progressOf(percent: Int) = (percent - DisplayPrefs.SCALE_MIN) / DisplayPrefs.SCALE_STEP
 
@@ -804,6 +854,61 @@ class DisplayPanelFragment : SettingsPanelFragment() {
                     )
                 }
             },
+        )
+    }
+
+    /** 弹出已配对蓝牙设备列表，选择「蓝牙音频目标」（车机本体出声）。 */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun showBtAudioPicker(view: View) {
+        val ctx = requireContext()
+        val bonded =
+            try {
+                (ctx.getSystemService(android.content.Context.BLUETOOTH_SERVICE) as android.bluetooth.BluetoothManager)
+                    .adapter
+                    ?.bondedDevices
+                    ?.toList()
+                    .orEmpty()
+            } catch (_: SecurityException) {
+                emptyList()
+            }
+        if (bonded.isEmpty()) {
+            hostToast("没有已配对的蓝牙设备——请先在系统蓝牙里配对车机")
+            return
+        }
+        val current = BluetoothAudioPrefs.get(ctx)
+        val actions = mutableListOf<DarkMessageDialog.Action>()
+        // 「关闭旁路」选项（恢复 AirPlay 音频路径）
+        actions +=
+            DarkMessageDialog.Action(
+                if (current == null) "关闭（已关闭）" else "关闭旁路（恢复 AirPlay 音频）",
+                DarkMessageDialog.Emphasis.DANGER,
+            ) {
+                BluetoothAudioPrefs.set(ctx, null)
+                view.findViewById<TextView>(R.id.btnBtAudioPick).text = "未设置——点击选择车机蓝牙"
+                hostToast("已关闭蓝牙音频旁路")
+            }
+        // 每台已配对设备一个选项（按名称排序，地址作为唯一键）
+        bonded
+            .sortedBy { it.name ?: it.address }
+            .forEach { device ->
+                val name = device.name ?: device.address
+                val isCurrent = current != null && BluetoothAudioPrefs.matches(current, device.address)
+                actions +=
+                    DarkMessageDialog.Action(
+                        label = name + (if (isCurrent) "（当前）" else ""),
+                        emphasis = if (isCurrent) DarkMessageDialog.Emphasis.PRIMARY else DarkMessageDialog.Emphasis.TEXT,
+                    ) {
+                        BluetoothAudioPrefs.set(ctx, BluetoothAudioPrefs.Target(device.address, name))
+                        view.findViewById<TextView>(R.id.btnBtAudioPick).text = "已选「$name」——点击更换"
+                        hostToast("蓝牙音频目标已设为「$name」——连接时声音走蓝牙 A2DP")
+                    }
+            }
+        DarkMessageDialog.show(
+            activity = requireActivity(),
+            title = "选择车机蓝牙（出声用）",
+            message = "画面走 CarPlay 盒子、声音走这里选的车机蓝牙。\n\n" +
+                "请选择车机本体（如 myBuick），不要选 CarPlay 盒子（SmartBox）或耳机。",
+            actions = actions,
         )
     }
 }
