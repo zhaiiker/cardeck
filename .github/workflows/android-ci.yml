@@ -25,6 +25,9 @@ on:
     branches: ['**'] # 任何分支的推送都出包；tag 不触发（不需要发 Release）
   workflow_dispatch:
 
+# 只在主仓库跑（shaonialife/cardeck）：fork/镜像仓库（如 zhaiiker/cardeck）没有
+# 配置签名 Secrets，跑了也只会以「缺 KEYSTORE_BASE64」失败——直接在 job 级跳过，
+# 省一次注定失败的构建。想在镜像仓库出包：配齐 Secrets 后删掉这个 if。
 permissions:
   contents: read # 只读代码，不发 Release、不写仓库
 
@@ -35,6 +38,7 @@ concurrency:
 jobs:
   build:
     name: 构建正式签名 APK
+    if: github.repository == 'shaonialife/cardeck'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
